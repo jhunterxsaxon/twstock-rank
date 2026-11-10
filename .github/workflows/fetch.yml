@@ -1,0 +1,114 @@
+name: 每日抓取台股資料
+
+# ──────────────────────────────────────────────────────────────
+# ★ 排程時間說明
+#
+# cron 用的是 UTC，台灣是 UTC+8：
+#   UTC 10:30  =  台灣 18:30   ← 主要排程
+#   UTC 14:30  =  台灣 22:30   ← 保險排程
+#
+# ★★ GitHub 的排程會延遲，而且延遲很大 ★★
+# 1151022s-1 專案實測：平均延遲 3.1 小時，最糟 6.9 小時。
+# 所以設 18:30 實際大約會在 21:30 ~ 01:30 之間執行。
+# 這裡延遲反而是好事 —— 官方資料收盤後要過一段時間才發布，
+# 實測 14:55（收盤後 85 分鐘）七個端點都還停在前一天。
+#
+# ★ 保險排程不會產生多餘的 commit：
+# fetch.py 會先打一個端點看「官方最新交易日是哪天」（1 次請求），
+# 如果那天我們已經有了就立刻結束，不做任何事、不 commit。
+# 所以實際上還是一天更新一次，只是多一次抓到當天資料的機會。
+#
+# 官方沒有公告頻率限制，而且一次只有 6~8 個請求，成本可以忽略。
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '30 10 * * 1-5'    # 台灣 18:30，週一到週五
+    - cron: '30 14 * * 1-5'    # 台灣 22:30，保險
+  workflow_dispatch:            # 也可以手動觸發
+    inputs:
+      force:
+        description: '即使沒有新資料也重跑'
+        type: boolean
+        default: false
+      rebuild:
+        description: '重算所有歷史榜單'
+        type: boolean
+        default: false
+
+# 要能 commit 回 repo
+permissions:
+  contents: write
+
+# 避免兩個排程同時跑而互相覆蓋
+concurrency:
+  group: fetch
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # fetch.py 只用標準函式庫（urllib、json、sqlite3），
+      # 刻意不裝任何套件 —— 少一個會壞掉的環節，也不用 cache。
+
+      - name: 抓取並計算榜單
+        env:
+          SCHEDULED_AT: ${{ github.event.schedule }}
+          TZ: Asia/Taipei
+        run: |
+          python fetch.py \
+            ${{ inputs.force && '--force' || '' }} \
+            ${{ inputs.rebuild && '--rebuild' || '' }}
+
+      - name: 有變動才 commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet --exit-code -- data/; then
+            echo "資料沒有變動，不 commit"
+            exit 0
+          fi
+          DATE=$(python -c "import json;print(json.load(open('data/meta.json'))['data_date'])")
+          git add data/
+          git commit -m "資料更新 ${DATE}"
+          # 兩個排程理論上被 concurrency 擋開了，但遠端若有新 commit
+          # 還是要先 rebase，否則 push 會被拒
+          git pull --rebase --autostash origin ${{ github.ref_name }} || true
+          git push
+
+      - name: 摘要
+        if: always()
+        run: |
+          if [ -f data/meta.json ]; then
+            python - <<'PY'
+          import json, os
+          m = json.load(open('data/meta.json'))
+          size = sum(os.path.getsize(os.path.join(r, f))
+                     for r, _, fs in os.walk('data') for f in fs)
+          lines = [
+            "| 項目 | 值 |", "|---|---|",
+            f"| 資料日期 | {m.get('data_date')} |",
+            f"| 是否當天 | {'是' if m.get('same_day') else '否（官方尚未更新）'} |",
+            f"| 排程 | {m.get('scheduled') or '手動'} |",
+            f"| 實際執行 | {m.get('run_at')} |",
+            f"| 累積交易日 | {m.get('trading_days')} |",
+            f"| 白名單 | {m.get('stocks')} 檔 |",
+            f"| data/ 大小 | {size/1024/1024:.2f} MB |",
+          ]
+          for n in (m.get('notes') or []):
+              lines.append(f"| 註記 | {n} |")
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a',
+               encoding='utf-8').write("\n".join(lines) + "\n")
+          PY
+          fi

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>台股排行榜</title>
+<meta name="description" content="每日成交量、成交金額、振幅、三大法人排行榜。資料來自臺灣證券交易所與證券櫃檯買賣中心。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>台股排行榜</h1>
+  <div id="freshness" class="fresh">載入中…</div>
+</header>
+
+<nav id="tabs" class="tabs"></nav>
+
+<main>
+  <!-- 榜單 -->
+  <section id="board-view">
+    <div class="toolbar">
+      <label>交易日
+        <select id="date-sel"></select>
+      </label>
+      <label>顯示前
+        <select id="top-sel">
+          <option>10</option><option>20</option><option>30</option>
+          <option>50</option><option selected>100</option>
+          <option>150</option><option>200</option><option>300</option>
+        </select> 名
+      </label>
+      <span id="board-note" class="note"></span>
+      <span class="grow"></span>
+      <button id="btn-codes" class="btn">複製代號清單</button>
+      <button id="btn-csv" class="btn">下載 CSV</button>
+    </div>
+
+    <div id="warn" class="warn" hidden></div>
+
+    <div class="tablewrap">
+      <table id="board-table">
+        <thead><tr>
+          <th data-sort="rank">排名</th>
+          <th data-sort="code">代號</th>
+          <th data-sort="name">名稱</th>
+          <th data-sort="metric" class="num">指標值</th>
+          <th data-sort="streak" class="num" data-gl="rank.streak">連續在榜</th>
+          <th data-gl="rank.new">標記</th>
+          <th data-sort="move" class="num" data-gl="rank.move">排名變化</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <details id="gone-box">
+      <summary>今日掉榜 <span id="gone-count"></span></summary>
+      <div class="tablewrap">
+        <table id="gone-table">
+          <thead><tr><th class="num">前一日排名</th><th>代號</th><th>名稱</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+
+    <div id="legend" class="legend"></div>
+  </section>
+
+  <!-- 分析結果（本機推上來的） -->
+  <section id="analysis-view" hidden>
+    <div id="analysis-body"></div>
+  </section>
+
+  <!-- 說明 -->
+  <section id="about-view" hidden>
+    <div id="about-body"></div>
+  </section>
+</main>
+
+<footer>
+  <div id="credit"></div>
+  <div class="small">
+    本站資料僅供參考，不構成投資建議。回測結果不代表未來績效。
+  </div>
+</footer>
+
+<div id="tip" class="tip"></div>
+<script src="app.js"></script>
+</body>
+</html>
