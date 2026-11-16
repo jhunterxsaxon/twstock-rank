@@ -321,6 +321,82 @@ def dump_meta(conn, date, scheduled=None, started=None, notes=None,
     return write(_p("meta.json"), meta)
 
 
+# ★ _ytd = 年初至今累計，不是單季。這不是命名潔癖：官方欄位叫
+#   「基本每股盈餘」，不帶後綴的話 UI 上會被當成單季盈餘。
+#   驗證過程見 core/fundamental.py 的 EPS_ITEMS。
+EPS_FIELDS = ["stock_id", "eps_ytd", "revenue_ytd", "op_income_ytd",
+              "non_op_ytd", "net_income_ytd"]
+REV_FIELDS = ["stock_id", "revenue", "last_month", "last_year", "mom_pct",
+              "yoy_pct", "acc", "acc_last_year", "acc_yoy_pct"]
+
+
+def dump_fundamental(conn):
+    """EPS、月營收、本益比匯出成獨立的一個檔。
+
+    ★ 為什麼不塞進 latest.json
+    榜單頁每次開啟都會載 latest.json，而基本面只有切到基本面頁才需要。
+    合併會讓首次載入憑空多幾百 KB —— 首次載入量是這個網站少數幾個
+    一旦變大就回不去的指標，check_web.py 有一條檢查盯著它。
+
+    ★ 為什麼保留全部期別而不是只留最新一季
+    「近四季 EPS」要 4 個季報。官方只給最新一季，補不回過去，
+    所以從現在開始每一季都要留著 —— 丟掉就永遠拿不回來了。
+    """
+    from core import db
+    eps = {}
+    for d, sid, item, v in conn.execute(
+            "SELECT date, stock_id, item, value FROM fundamental "
+            "WHERE kind='ytd' ORDER BY date, stock_id"):
+        eps.setdefault(d, {}).setdefault(sid, {})[item] = v
+    eps_out = {d: [[sid] + [m.get(k) for k in EPS_FIELDS[1:]]
+                   for sid, m in per.items()]
+               for d, per in eps.items()}
+
+    rev = {}
+    for row in conn.execute(
+            "SELECT ym, stock_id, revenue, last_month, last_year, mom_pct,"
+            " yoy_pct, acc, acc_last_year, acc_yoy_pct FROM revenue_month "
+            "ORDER BY ym, stock_id"):
+        rev.setdefault(row[0], []).append(list(row[1:]))
+
+    vd = db.last_trading_day(conn)
+    val = [list(r) for r in conn.execute(
+        "SELECT stock_id, per, pbr, yield_pct FROM valuation_daily "
+        "WHERE date=? ORDER BY stock_id", (vd,))]
+
+    return write(_p("fundamental.json"), {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "eps_fields": EPS_FIELDS, "eps": eps_out,
+        "rev_fields": REV_FIELDS, "revenue": rev,
+        "val_fields": VAL_FIELDS, "val_date": vd, "valuation": val,
+        "units": {"eps": "元", "revenue": "千元", "acc": "千元",
+                  "mom_pct": "%", "yoy_pct": "%", "acc_yoy_pct": "%"},
+        "note": "金額單位為千元，與官方原始資料一致（未換算）。"
+                "虧損公司沒有本益比，顯示為空白而不是 0。",
+    })
+
+
+def load_fundamental(conn):
+    """把 fundamental.json 讀回 SQLite，讓歷史期別累積下去。"""
+    from core import db
+    obj = read(_p("fundamental.json"), default={})
+    if not obj:
+        return 0, 0
+    n1 = 0
+    for d, rows in (obj.get("eps") or {}).items():
+        out = []
+        for r in rows:
+            for i, k in enumerate(EPS_FIELDS[1:], 1):
+                if i < len(r) and r[i] is not None:
+                    out.append((r[0], d, "ytd", k, r[i]))
+        n1 += db.upsert_fundamental(conn, out)
+    n2 = 0
+    for ym, rows in (obj.get("revenue") or {}).items():
+        n2 += db.upsert_revenue(
+            conn, [(r[0], ym) + tuple(r[1:9]) for r in rows])
+    return n1, n2
+
+
 def dump_glossary():
     """把名詞說明匯出成 JSON 給網頁用。
 

@@ -40,7 +40,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from core import db, netio, ranking, tpex, twse, universe, webstore as ws
+from core import (db, fundamental as fd, netio, ranking, tpex, twse,
+                  universe, webstore as ws)
 
 
 def log(m):
@@ -169,9 +170,12 @@ def main(argv=None):
     log("讀取既有資料…")
     conn = open_db()
     n_days = ws.load_into_db(conn)
+    n_eps, n_rev = ws.load_fundamental(conn)
     have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM price_daily")}
     log(f"  已有 {n_days} 個交易日"
         + (f"（{min(have)} ~ {max(have)}）" if have else "（全新的 repo）"))
+    if n_eps or n_rev:
+        log(f"  基本面：財報 {n_eps:,} 筆、月營收 {n_rev:,} 筆")
 
     log("查官方最新交易日…")
     try:
@@ -247,7 +251,9 @@ def main(argv=None):
             ("加權指數", lambda: _indices(conn)),
             ("融資融券", lambda: _margins(conn, d1, allow)),
             ("上櫃三大法人", lambda: _chips(conn, allow)),
-            ("上櫃本益比", lambda: _valuations(conn, allow)),
+            ("本益比（兩市）", lambda: _valuations(conn, allow)),
+            ("EPS 與財報", lambda: _eps(conn, allow)),
+            ("月營收", lambda: _revenue(conn, allow)),
             ("休市日曆", lambda: _holidays(conn))):
         log(f"抓{label}…")
         try:
@@ -284,6 +290,7 @@ def main(argv=None):
             ws.dump_month_boards(conn, ym)
     ws.dump_benchmark(conn)
     ws.dump_latest(conn, d1)
+    ws.dump_fundamental(conn)
     ws.dump_glossary()          # 名詞說明與本機 GUI 共用同一份
 
     miss = missing_days(conn, d1)
@@ -330,10 +337,59 @@ def _chips(conn, allow):
 
 
 def _valuations(conn, allow):
-    d, rows = tpex.fetch_valuation()
-    rows = [r for r in rows if r[0] in allow]
-    db.upsert_valuation(conn, rows)
-    return f"{len(rows)} 筆（官方只有上櫃）"
+    """★ 2026-11-16 起兩市都有了。
+
+    證交所的 BWIBBU_ALL 在 2026-11-10 曾回「因為安全性考量…」的 HTML，
+    專案因此一度記載「上市本益比只能靠 FinMind」。複測已經正常，
+    所以這裡把上市也加進來。
+    """
+    out = []
+    for name, fn in (("上市", twse.fetch_valuation),
+                     ("上櫃", tpex.fetch_valuation)):
+        try:
+            _d, rows = fn()
+            rows = [r for r in rows if r[0] in allow]
+            db.upsert_valuation(conn, rows)
+            out.append(f"{name} {len(rows)} 筆")
+        except Exception as e:
+            out.append(f"{name} 失敗（{e}）")
+    return "、".join(out)
+
+
+def _eps(conn, allow):
+    """EPS 與單季財報（官方開放資料，可散布）。
+
+    ★ misses 要印出來
+    欄位對不上時 .get() 只會回 None，不報錯，整欄靜悄悄變空白 ——
+    看起來像「這些公司沒公布」。所以把對不到的數量印出來：
+    個位數是正常的（金控、保險業本來就不報「營業利益」），
+    若接近總筆數就代表欄位名又改了。
+    """
+    out = []
+    for mk in ("twse", "tpex"):
+        period, rows, miss = fd.fetch_eps(mk)
+        rows = [r for r in rows if r[0] in allow]
+        db.upsert_fundamental(conn, rows)
+        extra = f"（欄位對不到：{miss}）" if miss else ""
+        out.append(f"{mk} {period} {len(rows)} 筆{extra}")
+    return "、".join(out)
+
+
+def _revenue(conn, allow):
+    """每月營業收入（含官方自己算的月增率、年增率、累計）。
+
+    ★ 年增率不自己算
+    官方在併購、會計年度變更時的分母處理我們無從得知，
+    自己算會和官方公布的數字對不起來 —— 那種不一致最難解釋。
+    """
+    out = []
+    for mk in ("twse", "tpex"):
+        ym, rows, miss = fd.fetch_revenue(mk)
+        rows = [r for r in rows if r[0] in allow]
+        db.upsert_revenue(conn, rows)
+        extra = f"（欄位對不到：{miss}）" if miss else ""
+        out.append(f"{mk} {ym} {len(rows)} 筆{extra}")
+    return "、".join(out)
 
 
 def _holidays(conn):

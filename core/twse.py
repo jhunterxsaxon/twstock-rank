@@ -16,9 +16,11 @@
 
 - **OpenAPI 完全不吃 `date` 參數**。實測 `STOCK_DAY_ALL?date=20260504` 回 HTTP 200，
   但資料全是最新交易日 —— 參數被忽略。所以官方 API 只能每日累積，不能回補。
-- **`BWIBBU_ALL`（本益比）被安全防護擋掉**，回傳 HTML
-  「因為安全性考量，您所執行的頁面無法呈現」。其他端點用同一個 User-Agent 都正常，
-  所以不是被封鎖，是這個端點本身的問題。**不嘗試偽裝繞過**，待查。
+- **`BWIBBU_ALL`（本益比）2026-11-16 複測已經正常**，回 1,086 筆，
+  含 PEratio / DividendYield / PBratio。
+  ★ 2026-11-10 當時它回 HTML「因為安全性考量，您所執行的頁面無法呈現」，
+  所以專案一度判定「上市本益比只能靠 FinMind」。**那個結論已經過時。**
+  `BWIBBU_d` 還多給 ClosePrice 與 FiscalYearQuarter。
 - **`MI_MARGN` 回傳的資料裡沒有日期欄位**，要用同一輪 `STOCK_DAY_ALL` 的日期。
 - 證交所的「上市個股日成交資訊」含 ETF 與特別股（1,389 筆中有 245 筆 00 開頭），
   所以一定要過白名單。
@@ -32,7 +34,9 @@ EP_MARGIN = f"{BASE}/exchangeReport/MI_MARGN"
 EP_COMPANY = f"{BASE}/opendata/t187ap03_L"
 EP_INDEX = f"{BASE}/exchangeReport/MI_INDEX"
 EP_HOLIDAY = f"{BASE}/holidaySchedule/holidaySchedule"
-EP_PER = f"{BASE}/exchangeReport/BWIBBU_ALL"      # 目前被擋，見模組說明
+EP_PER = f"{BASE}/exchangeReport/BWIBBU_ALL"      # 本益比／殖利率／股價淨值比
+EP_EPS = f"{BASE}/opendata/t187ap14_L"            # 各年度 EPS 統計
+EP_REVENUE = f"{BASE}/opendata/t187ap05_L"        # 每月營業收入彙總表
 
 SOURCE_CREDIT = "臺灣證券交易所"
 
@@ -205,6 +209,36 @@ def fetch_indices():
 
 
 # ---------------- 休市日曆 ----------------
+
+def fetch_valuation():
+    """當日全市場上市的本益比、殖利率、股價淨值比。回傳 (date, rows)。
+
+    ★ 和 tpex.fetch_valuation() 回傳同樣的形狀，呼叫端不必分兩套。
+
+    欄位（實測 1,086 筆）：Date、Code、Name、PEratio、DividendYield、PBratio。
+    `BWIBBU_d` 還多給 ClosePrice 與 FiscalYearQuarter，但那兩個我們不需要
+    （收盤價自己有，而且用別人的收盤價和自己的對不起來時很難查）。
+
+    ★ 本益比可能是空字串或 "-"（虧損的公司沒有本益比），
+    netio.num() 會回 None，不要硬塞 0 —— 本益比 0 和「沒有本益比」
+    在排序和篩選上是完全不同的意思。
+    """
+    data = netio.get_json(EP_PER, limiter=_limiter)
+    if not data:
+        return None, []
+    date = netio.roc_to_iso(data[0].get("Date"))
+    out = []
+    for r in data:
+        sid = str(r.get("Code") or "").strip()
+        if not sid:
+            continue
+        out.append((sid, date,
+                    netio.num(r.get("PEratio")),
+                    netio.num(r.get("PBratio")),
+                    netio.num(r.get("DividendYield")),
+                    "twse"))
+    return date, out
+
 
 def fetch_holidays():
     """休市日曆。只用來交叉驗證與顯示，不參與交易日計算。"""

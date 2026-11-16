@@ -119,6 +119,7 @@
       html += '<button data-tab="board" data-board="' + b + '">'
             + esc(zh[b] || b) + '</button>';
     });
+    html += '<button data-tab="fund">基本面</button>';
     html += '<button data-tab="analysis">分析與選股</button>';
     html += '<button data-tab="about">說明</button>';
     $('#tabs').innerHTML = html;
@@ -151,9 +152,11 @@
     S.view = v;
     $('#board-view').hidden = v !== 'board';
     $('#analysis-view').hidden = v !== 'analysis';
+    $('#fund-view').hidden = v !== 'fund';
     $('#about-view').hidden = v !== 'about';
     if (v === 'board') renderBoard();
     if (v === 'analysis') renderAnalysis();
+    if (v === 'fund') openFund();
     if (v === 'about') renderAbout();
     markTab();
   }
@@ -383,6 +386,187 @@
   }
 
   /* ---------------- 說明頁 ---------------- */
+
+  /* ---------------- 基本面 ---------------- */
+
+  /* 延後載入：fundamental.json 約 355 KB，只有切到這一頁才需要。
+     首次載入量是這個網站少數幾個「一旦變大就回不去」的指標，
+     所以不跟 latest.json 綁在一起。 */
+  function openFund() {
+    if (S.fund) { renderFund(); return; }
+    $('#fund-body').innerHTML = '<p class="muted">載入中…</p>';
+    get('data/fundamental.json').then(function (o) {
+      S.fund = o; renderFund();
+    }).catch(function (e) {
+      $('#fund-body').innerHTML =
+        '<p class="lag">基本面資料載入失敗：' + esc(e.message) + '</p>';
+    });
+  }
+
+  function qLabel(d) {
+    var m = parseInt(String(d).slice(5, 7), 10);
+    return String(d).slice(0, 4) + ' 年第 ' + Math.ceil(m / 3) + ' 季';
+  }
+
+  /* 官方單位是千元；千元 -> 億元 要除以 100,000。
+     換算只在顯示層做 —— 存檔保持官方原始單位，
+     否則日後很難查出某個數字是在哪裡被乘過。 */
+  function yi(v) {
+    if (v === null || v === undefined) return '—';
+    return (v / 100000).toFixed(1);
+  }
+
+  /* ★ 這裡刻意沒有自己的 pct()。
+     上面已經有一支 pct(v, plus)，回傳的是**完整的 <td>**（含 up/down
+     漲跌配色），分析與選股頁在用。我原本又寫了一支同名、回傳純文字的
+     —— 因為定義在後面會覆蓋掉它，分析頁的表格會少了 <td> 而整個塌掉。
+     括號平衡檢查和 check_web.py 都抓不到這種錯，是撞名檢查抓到的。
+     結論：沿用既有那支，順便拿到漲跌配色。 */
+
+  function fnum(v, dp) {
+    if (v === null || v === undefined) return '—';
+    return v.toFixed(dp === undefined ? 2 : dp);
+  }
+
+  /* 沒有數值的一律排到最後，不管升冪降冪。
+     把 null 當成 0 會讓「虧損所以沒有本益比」的公司排到最前面，
+     看起來像是最便宜的股票 —— 那是完全相反的意思。 */
+  function cmpNum(a, b, dir) {
+    var na = (a === null || a === undefined);
+    var nb = (b === null || b === undefined);
+    if (na && nb) return 0;
+    if (na) return 1;
+    if (nb) return -1;
+    return (a - b) * dir;
+  }
+
+  var FUND_SORTS = [
+    ['per_asc', '本益比低 → 高',
+      function (a, b) { return cmpNum(a.per, b.per, 1); }],
+    ['yield_desc', '殖利率高 → 低',
+      function (a, b) { return cmpNum(a.yield_pct, b.yield_pct, -1); }],
+    ['yoy_desc', '營收年增率高 → 低',
+      function (a, b) { return cmpNum(a.rev_yoy_pct, b.rev_yoy_pct, -1); }],
+    ['eps_desc', '累計 EPS 高 → 低',
+      function (a, b) { return cmpNum(a.eps_ytd, b.eps_ytd, -1); }],
+    ['rev_desc', '月營收大 → 小',
+      function (a, b) { return cmpNum(a.rev_revenue, b.rev_revenue, -1); }],
+    ['pbr_asc', '股價淨值比低 → 高',
+      function (a, b) { return cmpNum(a.pbr, b.pbr, 1); }]
+  ];
+
+  function fundRows() {
+    var o = S.fund, nm = names();
+    var epsDates = Object.keys(o.eps || {}).sort();
+    var revYms = Object.keys(o.revenue || {}).sort();
+    var ed = epsDates[epsDates.length - 1];
+    var ry = revYms[revYms.length - 1];
+    var byId = {};
+    function slot(id) {
+      if (!byId[id]) byId[id] = { id: id, name: nm[id] || '' };
+      return byId[id];
+    }
+    ((o.eps || {})[ed] || []).forEach(function (r) {
+      var s = slot(r[0]);
+      o.eps_fields.forEach(function (f, i) { if (i) s[f] = r[i]; });
+    });
+    ((o.revenue || {})[ry] || []).forEach(function (r) {
+      var s = slot(r[0]);
+      o.rev_fields.forEach(function (f, i) { if (i) s['rev_' + f] = r[i]; });
+    });
+    (o.valuation || []).forEach(function (r) {
+      var s = slot(r[0]);
+      o.val_fields.forEach(function (f, i) { if (i) s[f] = r[i]; });
+    });
+    return {
+      rows: Object.keys(byId).map(function (k) { return byId[k]; }),
+      epsDate: ed, revYm: ry
+    };
+  }
+
+  function renderFund() {
+    var o = S.fund, d = fundRows();
+    var sortId = S.fundSort || FUND_SORTS[0][0];
+    var q = (S.fundQ || '').trim();
+    var rows = d.rows;
+    if (q) {
+      rows = rows.filter(function (r) {
+        return r.id.indexOf(q) >= 0 || (r.name || '').indexOf(q) >= 0;
+      });
+    }
+    var sorter = FUND_SORTS.filter(function (s) {
+      return s[0] === sortId;
+    })[0] || FUND_SORTS[0];
+    rows = rows.slice().sort(sorter[2]);
+    var shown = rows.slice(0, 100);
+
+    var html = '<div class="card"><h2>基本面</h2>'
+      + '<p class="muted">資料來自<b>臺灣證券交易所</b>與<b>證券櫃檯買賣中心</b>'
+      + '的公開資料（政府資料開放授權條款），與榜單同源，可以公開散布。</p>'
+      + '<dl class="kv">'
+      + '<dt>財報期別</dt><dd>' + esc(qLabel(d.epsDate))
+      + '　<b>累計至該季</b>，不是單季</dd>'
+      + '<dt>營收月份</dt><dd>' + esc(d.revYm) + '</dd>'
+      + '<dt>本益比日期</dt><dd>' + esc(o.val_date || '—') + '</dd>'
+      + '</dl>'
+      + '<p class="muted">★ <b>EPS 與財報數字是「年初至今累計」。</b>'
+      + '官方端點叫「各年度EPS統計資訊」、欄位叫「基本每股盈餘」，'
+      + '沒有任何地方寫著累計 —— 但用月營收交叉驗證過：'
+      + 'EPS 表的營業收入，與「累計營收減去最新月份」完全相等（差額 0）。'
+      + '所以台積電那筆 78.75 是前三季累計，不是單季賺 78 元。'
+      + '要換算單季得用相鄰期別相減，不是把四季相加。</p>'
+      + '<p class="muted">金額單位為<b>億元</b>（官方原始資料是千元，'
+      + '此處僅在顯示時換算）。虧損的公司沒有本益比，顯示「—」而不是 0，'
+      + '排序時一律排在最後。</p>'
+      + '</div>';
+
+    html += '<div class="card"><div class="toolbar">'
+      + '<label>排序　<select id="fund-sort">';
+    FUND_SORTS.forEach(function (s) {
+      html += '<option value="' + s[0] + '"'
+        + (s[0] === sortId ? ' selected' : '') + '>' + esc(s[1]) + '</option>';
+    });
+    html += '</select></label>'
+      + '<label>　搜尋　<input id="fund-q" type="search" '
+      + 'placeholder="代號或名稱" value="' + esc(q) + '"></label>'
+      + '<span class="muted">　符合 ' + rows.length + ' 檔，顯示前 '
+      + shown.length + ' 檔</span></div>';
+
+    html += '<div class="tablewrap"><table><thead><tr>'
+      + '<th>代號</th><th>名稱</th><th>本益比</th><th>股價淨值比</th>'
+      + '<th>殖利率</th><th>累計EPS</th><th>累計營收(億)</th>'
+      + '<th>營業利益(億)</th><th>稅後淨利(億)</th>'
+      + '<th>月營收(億)</th><th>月增</th><th>年增</th><th>累計年增</th>'
+      + '</tr></thead><tbody>';
+    shown.forEach(function (r) {
+      html += '<tr><td>' + esc(r.id) + '</td><td>' + esc(r.name) + '</td>'
+        + '<td>' + fnum(r.per) + '</td>'
+        + '<td>' + fnum(r.pbr) + '</td>'
+        + '<td>' + (r.yield_pct === null || r.yield_pct === undefined
+          ? '—' : fnum(r.yield_pct) + '%') + '</td>'
+        + '<td>' + fnum(r.eps_ytd) + '</td>'
+        + '<td>' + yi(r.revenue_ytd) + '</td>'
+        + '<td>' + yi(r.op_income_ytd) + '</td>'
+        + '<td>' + yi(r.net_income_ytd) + '</td>'
+        + '<td>' + yi(r.rev_revenue) + '</td>'
+        + pct(r.rev_mom_pct)
+        + pct(r.rev_yoy_pct)
+        + pct(r.rev_acc_yoy_pct) + '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+    $('#fund-body').innerHTML = html;
+
+    $('#fund-sort').addEventListener('change', function () {
+      S.fundSort = this.value; renderFund();
+    });
+    $('#fund-q').addEventListener('input', function () {
+      S.fundQ = this.value;
+      renderFund();
+      var el = $('#fund-q');
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }
 
   function renderAbout() {
     var m = S.meta || {};

@@ -130,9 +130,16 @@ CREATE TABLE IF NOT EXISTS fundamental (
 );
 
 CREATE TABLE IF NOT EXISTS revenue_month (
-  stock_id TEXT NOT NULL,
-  ym       TEXT NOT NULL,      -- 'YYYY-MM'，營收所屬月份（不是公布月份）
-  revenue  REAL,
+  stock_id      TEXT NOT NULL,
+  ym            TEXT NOT NULL,   -- 'YYYY-MM'，營收所屬月份（不是公布月份）
+  revenue       REAL,            -- 當月營收（單位：千元，官方原始單位）
+  last_month    REAL,            -- 上月營收
+  last_year     REAL,            -- 去年當月營收
+  mom_pct       REAL,            -- 上月比較增減 %
+  yoy_pct       REAL,            -- 去年同月增減 %
+  acc           REAL,            -- 當月累計營收
+  acc_last_year REAL,            -- 去年累計營收
+  acc_yoy_pct   REAL,            -- 累計前期比較增減 %
   PRIMARY KEY (stock_id, ym)
 );
 
@@ -297,6 +304,37 @@ def upsert_valuation(conn, rows):
         "ON CONFLICT(stock_id,date) DO UPDATE SET "
         "per=excluded.per, pbr=excluded.pbr, yield_pct=excluded.yield_pct, "
         "src=excluded.src", rows)
+    return len(rows)
+
+
+def upsert_fundamental(conn, rows):
+    """rows: (stock_id, date, kind, item, value)
+
+    ★ `item` 是我們自己的鍵（eps / revenue / net_income…），不是官方欄位名。
+    官方兩市的欄位名不一致而且會改版，所以對應關係集中在
+    core/fundamental.py 的 EPS_ITEMS，這裡只存正規化後的結果。
+    """
+    conn.executemany(
+        "INSERT INTO fundamental (stock_id,date,kind,item,value) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(stock_id,date,kind,item) DO UPDATE SET "
+        "value=excluded.value", rows)
+    return len(rows)
+
+
+def upsert_revenue(conn, rows):
+    """rows: (stock_id, ym, revenue, last_month, last_year, mom_pct,
+              yoy_pct, acc, acc_last_year, acc_yoy_pct)"""
+    conn.executemany(
+        "INSERT INTO revenue_month (stock_id,ym,revenue,last_month,"
+        "last_year,mom_pct,yoy_pct,acc,acc_last_year,acc_yoy_pct) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(stock_id,ym) DO UPDATE SET "
+        "revenue=excluded.revenue, last_month=excluded.last_month, "
+        "last_year=excluded.last_year, mom_pct=excluded.mom_pct, "
+        "yoy_pct=excluded.yoy_pct, acc=excluded.acc, "
+        "acc_last_year=excluded.acc_last_year, "
+        "acc_yoy_pct=excluded.acc_yoy_pct", rows)
     return len(rows)
 
 
