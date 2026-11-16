@@ -19,7 +19,7 @@ FinMind 四個方案全部禁止再散布原始資料，而且無 token 的額�
     1. 讀 data/*.json → 灌進暫時的 SQLite
     2. 先打一個端點看「最新交易日是哪天」
        → 如果那天我們已經有了，**立刻結束、不 commit**
-         （22:30 的保險排程就是靠這個，有新資料才做事）
+         （排程每 2 小時跑一次，就是靠這個避免產生重複的 commit）
     3. 抓官方資料 → SQLite
     4. 用和本機版完全相同的 ranking.py 算榜單
     5. 匯出 JSON
@@ -34,13 +34,27 @@ import os
 import sqlite3
 import sys
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from core import db, netio, ranking, tpex, twse, universe, webstore as ws
 
 
 def log(m):
-    print(f"[{datetime.now():%H:%M:%S}] {m}", flush=True)
+    """★ 印不出來不可以變成「抓到一半爆掉」
+
+    Windows 主控台預設編碼是 cp950，印到 U+26A0（警告符號）這類字元會丟
+    UnicodeEncodeError。實際踩過：抓完資料、JSON 匯出到一半時才爆，
+    留下沒有 meta.json 的半套 data/。
+
+    顯示問題不該毀掉資料，所以這裡一律降級處理。
+    （GitHub Actions 上是 UTF-8，只有本機執行才踩得到。）
+    """
+    line = f"[{datetime.now():%H:%M:%S}] {m}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "utf-8"
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
 
 
 def open_db():
@@ -61,6 +75,36 @@ def peek_latest_date():
     if not data:
         return None
     return netio.roc_to_iso(data[0].get("Date"))
+
+
+def missing_days(conn, latest):
+    """找出「照理說該有、但我們沒有」的交易日。
+
+    ★ 為什麼需要這個
+    官方 OpenAPI 只提供**最新一個交易日**，不支援指定日期（實測確認：
+    傳 date 參數會被忽略）。所以一旦某天沒抓到，那天就**永久補不回來**。
+
+    2026-11-13（週五）就是這樣掉的 —— 舊排程只跑週一到週五，而週五的
+    資料要到週六清晨才出現。當時完全沒有任何警告，meta.json 上只會看到
+    trading_days 少一個，沒人會發現。
+
+    ★ 判斷依據與限制
+    「平日扣掉休市日曆」。颱風假這類臨時休市不會事先出現在日曆上，
+    所以這裡回報的是**疑似**漏掉，不是確定漏掉 —— 寧可多報也不要漏報，
+    因為漏報的代價是資料永久消失。
+    """
+    have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM price_daily")}
+    if not have or not latest:
+        return []
+    holi = {r[0] for r in conn.execute("SELECT date FROM holiday")}
+    d, end = date.fromisoformat(min(have)), date.fromisoformat(latest)
+    out = []
+    while d <= end:
+        s = d.isoformat()
+        if d.weekday() < 5 and s not in holi and s not in have:
+            out.append(s)
+        d += timedelta(days=1)
+    return out
 
 
 def main(argv=None):
@@ -89,10 +133,10 @@ def main(argv=None):
         traceback.print_exc()
         return 1
     log(f"  官方目前提供 {latest}")
-    today = datetime.now().strftime("%Y-%m-%d")
-    if latest != today:
-        notes.append(f"官方資料仍停在 {latest}（今天是 {today}）—— "
-                     f"這是正常的，官方不是收盤後馬上更新")
+    # ★ 這裡原本每次都會寫一條「官方資料仍停在 X（今天是 Y）」的註記。
+    # 但官方是隔天清晨才發布，latest 永遠不可能等於今天 —— 等於每跑必出，
+    # 結果就是網頁上的警告區永遠有東西，真正要緊的警告（漏掉交易日、
+    # 榜單鑑別度不足）反而被稀釋掉。改由 meta 的 age_days 表達落後幾天。
 
     if latest in have and not a.force and not a.rebuild:
         log(f"  {latest} 的資料已經有了，沒有新東西 → 結束，不產生 commit")
@@ -180,7 +224,14 @@ def main(argv=None):
     ws.dump_benchmark(conn)
     ws.dump_latest(conn, d1)
     ws.dump_glossary()          # 名詞說明與本機 GUI 共用同一份
-    ws.dump_meta(conn, d1, scheduled=a.scheduled, notes=notes)
+
+    miss = missing_days(conn, d1)
+    if miss:
+        log(f"⚠ 疑似漏掉 {len(miss)} 個交易日：{'、'.join(miss)}")
+        notes.append(
+            f"疑似漏掉 {len(miss)} 個交易日（{'、'.join(miss)}）—— "
+            f"官方 API 不支援查詢過去的日期，這些日子補不回來")
+    ws.dump_meta(conn, d1, scheduled=a.scheduled, notes=notes, missing=miss)
     ws.history_index()
 
     total = 0

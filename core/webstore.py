@@ -269,20 +269,32 @@ def dump_latest(conn, date):
     })
 
 
-def dump_meta(conn, date, scheduled=None, started=None, notes=None):
+def dump_meta(conn, date, scheduled=None, started=None, notes=None,
+              missing=None):
     """★ 時間戳三件套：排程時間、實際執行時間、資料日期。
 
     這樣就能測出 GitHub Actions 的實際延遲，以及官方資料幾點才更新 ——
     不用猜，讓它自己記錄。（1151022s-1 就是這樣測出平均延遲 3.1 小時的。）
+
+    ★ 這份紀錄確實派上用場了：把歷史上每一次 commit 的 meta.json 排成
+    時間軸，夾出官方資料是**隔天台北 05:30~06:00** 才更新，推翻了上線時
+    「收盤後一兩小時」的假設，排程因此整個重排。
+
+    ★ age_days 取代了原本的 same_day
+    same_day 永遠是 False —— 因為官方隔天清晨才更新，當天抓到當天
+    在物理上就不可能。一個恆為假的欄位沒有資訊量，還會讓人以為
+    是暫時現象。改成「資料距今幾個日曆天」，這個數字變大才是真的有事。
     """
     from core import ranking
     days = [r[0] for r in conn.execute(
         "SELECT DISTINCT date FROM price_daily ORDER BY date")]
-    lag = None
-    if date and days:
-        today = datetime.now().strftime("%Y-%m-%d")
-        lag = sum(1 for d in days if d > date)  # 幾個交易日之前
-        lag = 0 if date == today else None
+    age = None
+    if date:
+        try:
+            age = (datetime.now().date()
+                   - datetime.strptime(date, "%Y-%m-%d").date()).days
+        except ValueError:
+            age = None
     now = datetime.now(timezone.utc)
     q = lambda s: conn.execute(s).fetchone()[0]
     meta = {
@@ -291,6 +303,8 @@ def dump_meta(conn, date, scheduled=None, started=None, notes=None):
         "run_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_at_tpe": now.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
         "same_day": (date == datetime.now().strftime("%Y-%m-%d")),
+        "age_days": age,
+        "missing": list(missing or []),
         "trading_days": len(days),
         "first_date": days[0] if days else None,
         "stocks": q("SELECT COUNT(*) FROM stock"),

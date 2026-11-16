@@ -81,9 +81,16 @@
              + '</b>（資料本身的交易日）</span>');
     parts.push('<span><b>更新時間　' + esc(m.run_at_tpe || m.run_at || '—')
              + '</b>（自動抓取執行的時刻）</span>');
-    if (m.same_day === false) {
-      parts.push('<span class="lag">⚠ 官方資料還沒更新到今天 —— '
-               + '這是正常的，收盤後要過一段時間才會發布</span>');
+    /* 官方的收盤資料是隔天台北清晨 5:30~6:00 才發布（實測夾出來的），
+       所以「當天看到當天」在物理上不可能。原本那句「還沒更新到今天」
+       永遠會出現，等於沒有資訊。改成顯示實際落後幾天，而且只有在
+       真的異常（超過一個連假的長度）時才標成警告色。 */
+    var age = m.age_days;
+    if (typeof age === 'number' && age >= 1) {
+      parts.push('<span' + (age > 4 ? ' class="lag"' : '') + '>落後　<b>'
+               + age + ' 天</b>（官方隔天清晨才發布，遇週末或連假會拉長）'
+               + (age > 4 ? '　⚠ 比平常久，可能是連假，也可能是排程失準' : '')
+               + '</span>');
     }
     if (S.analysis && S.analysis.generated) {
       parts.push('<span>分析結果　<b>' + esc(S.analysis.generated)
@@ -389,8 +396,9 @@
       + '直接用的話「前 100 檔股票」會有三分之二不是股票。</p></div>';
 
     html += '<div class="card"><h2>資料更新</h2><dl class="kv">'
-      + '<dt>自動抓取</dt><dd>每個交易日台灣時間 18:30，'
-      + '若當時官方尚未更新，22:30 會再試一次</dd>'
+      + '<dt>自動抓取</dt><dd>每 2 小時檢查一次（每天，含週末）。'
+      + '官方的收盤資料約在<b>隔天台灣時間清晨 5:30~6:00</b> 才發布，'
+      + '所以本站最快也是隔天早上才會出現前一個交易日的資料</dd>'
       + '<dt>資料日期</dt><dd>' + esc(m.data_date || '—') + '</dd>'
       + '<dt>累積天數</dt><dd>' + esc(m.trading_days || 0) + ' 個交易日'
       + (m.first_date ? '（自 ' + esc(m.first_date) + ' 起）' : '') + '</dd>'
