@@ -394,6 +394,32 @@ def prev_trading_day(conn, date):
     return r[0] if r else None
 
 
+def complete_days(conn):
+    """兩市都有資料的交易日（升冪）。
+
+    ★ 為什麼需要「完整」這個概念
+    櫃買在台北 16:00 就發布當日收盤，證交所要等隔天 05:20。
+    所以 16:00~05:20 之間抓取，會得到一個**只有上櫃**的日期。
+    那種日期不能拿來算榜單或技術指標（會變成半個市場），
+    也不能拿來判斷「這天是不是已經抓過了」。
+
+    市場別用 stock.market 判斷，不用 price_daily.src ——
+    月檔 JSON 沒有存 src，載回 DB 之後那個欄位是空的。
+    """
+    return [d for d, n in conn.execute(
+        "SELECT p.date, COUNT(DISTINCT s.market) FROM price_daily p "
+        "JOIN stock s ON s.stock_id = p.stock_id "
+        "GROUP BY p.date ORDER BY p.date") if n >= 2]
+
+
+def partial_days(conn):
+    """只有單一市場的交易日 —— 要顯示出來，不能靜靜放著。"""
+    return [(d, m) for d, m, n in conn.execute(
+        "SELECT p.date, MIN(s.market), COUNT(DISTINCT s.market) "
+        "FROM price_daily p JOIN stock s ON s.stock_id = p.stock_id "
+        "GROUP BY p.date ORDER BY p.date") if n < 2]
+
+
 def whitelist(conn):
     """白名單的 stock_id 集合。"""
     return {r[0] for r in conn.execute("SELECT stock_id FROM stock")}

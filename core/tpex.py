@@ -45,6 +45,7 @@ EP_MARGIN = f"{BASE}/tpex_mainboard_margin_balance"
 EP_CHIP = f"{BASE}/tpex_3insti_daily_trading"
 EP_COMPANY = f"{BASE}/mopsfin_t187ap03_O"
 EP_VALUATION = f"{BASE}/tpex_mainboard_peratio_analysis"
+EP_DIVIDEND = f"{BASE}/tpex_exright_daily"
 
 SOURCE_CREDIT = "證券櫃檯買賣中心"
 
@@ -204,6 +205,35 @@ def _iso8(s):
 
 
 # ---------------- 本益比／殖利率／股價淨值比 ----------------
+
+def fetch_dividends():
+    """上櫃的除權息。回傳 dividend 表的 rows。
+
+    ★ 比證交所那支好用：它直接給「除權息前收盤」與「除權息參考價」，
+    還原係數 = 參考價 / 前收盤，不必自己推算，也不會因為
+    股票股利的單位解讀錯誤而算歪。
+
+    欄位：Date、SecuritiesCompanyCode、
+          ClosePriceBeforeExRightsDiviend（除權息前收盤）、
+          ExRightsDiviendQuote（除權息參考價）、
+          CashDividend、StockDividend。
+    """
+    data = netio.get_json(EP_DIVIDEND, limiter=_limiter)
+    out = []
+    for r in data:
+        sid = str(_pick(r, "securitiescompanycode", required=False) or "").strip()
+        d = netio.roc_to_iso(r.get("Date"))
+        if not sid or not d:
+            continue
+        out.append((
+            sid, d,
+            netio.num(_pick(r, "cashdividend", required=False)),
+            netio.num(_pick(r, "stockdividend", required=False)),
+            netio.num(_pick(r, "closepricebeforeexrightsdiviend",
+                            required=False)),
+            netio.num(_pick(r, "exrightsdiviendquote", required=False))))
+    return out
+
 
 def fetch_valuation():
     """當日全市場上櫃的本益比、殖利率、股價淨值比。回傳 (date, rows)。

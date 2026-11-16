@@ -397,6 +397,33 @@ def load_fundamental(conn):
     return n1, n2
 
 
+def dump_technical(conn, progress=None):
+    """算出最新交易日的技術指標並匯出。
+
+    ★ 獨立一個檔、延後載入
+    和 fundamental.json 同樣的理由：榜單頁每次開啟都會載 latest.json，
+    技術指標只有切到技術面頁才需要。
+
+    ★ ready 一起存
+    前端必須知道「這個指標現在算不算得出來」。資料不足時要顯示
+    「還需要 N 天」而不是空白 —— 空白看起來像壞掉，而且使用者
+    無從得知它什麼時候會有。
+    """
+    from core import db, technical as tc
+    date, rows, ready = tc.compute(conn, allow=db.whitelist(conn),
+                                   progress=progress)
+    return write(_p("technical.json"), {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "date": date,
+        "fields": tc.FIELDS,
+        "zh": tc.ZH,
+        "ready": ready,
+        "rows": rows,
+        "note": "價格為還原股價（已調整除權息），與看盤軟體上的成交價不同。"
+                "資料不足的指標不顯示數字，改顯示還需要幾個交易日。",
+    })
+
+
 def dump_glossary():
     """把名詞說明匯出成 JSON 給網頁用。
 

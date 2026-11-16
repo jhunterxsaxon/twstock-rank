@@ -102,8 +102,19 @@ jobs:
         with:
           python-version: '3.12'
 
-      # fetch.py 只用標準函式庫（urllib、json、sqlite3），
-      # 刻意不裝任何套件 —— 少一個會壞掉的環節，也不用 cache。
+      # ★ 抓取本身只用標準函式庫（urllib、json、sqlite3）。
+      # pandas 只有「算技術指標」那一步需要 —— core/indicators.py 是
+      # 和本機 GUI **共用同一份檔案**（sha256 相同），所以邏輯只有一份。
+      # 另寫一份純 Python 的版本會變成兩套邏輯，而指標很容易分岔
+      # （平滑方式、初始值、NaN 處理差一點結果就不同）。
+      # 「網頁上的 KD 和 GUI 上的 KD 不一樣」比多一個依賴糟糕得多。
+      - name: 安裝 pandas（只有算指標需要）
+        # ★ 版本必須和本機 GUI 的環境一致。
+        # 共用同一份 indicators.py 的目的是「兩邊算出同樣的數字」，
+        # 如果 pandas 大版本不同（rolling/ewm 的預設值改過），
+        # 共用檔案的保證就失效了 —— 那比各寫一份還糟，因為會讓人誤以為一致。
+        run: pip install --no-cache-dir "pandas==3.0.1" "numpy==2.4.2"
+
 
       - name: 抓取並計算榜單
         env:

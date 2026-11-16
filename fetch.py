@@ -172,10 +172,14 @@ def main(argv=None):
     n_days = ws.load_into_db(conn)
     n_eps, n_rev = ws.load_fundamental(conn)
     have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM price_daily")}
+    part = db.partial_days(conn)
     log(f"  已有 {n_days} 個交易日"
         + (f"（{min(have)} ~ {max(have)}）" if have else "（全新的 repo）"))
     if n_eps or n_rev:
         log(f"  基本面：財報 {n_eps:,} 筆、月營收 {n_rev:,} 筆")
+    if part:
+        log("  ⚠ 只有單一市場的日期："
+            + "、".join(f"{d}（只有{m}）" for d, m in part))
 
     log("查官方最新交易日…")
     try:
@@ -196,7 +200,13 @@ def main(argv=None):
     # 結果就是網頁上的警告區永遠有東西，真正要緊的警告（漏掉交易日、
     # 榜單鑑別度不足）反而被稀釋掉。改由 meta 的 age_days 表達落後幾天。
 
-    skip = latest in have and not a.force and not a.rebuild
+    # ★ 這裡**不能**用 `latest in have`。
+    # 櫃買 16:00 就發布當日資料，所以 price_daily 裡可能已經有一個
+    # 只含上櫃的 `latest`。用 have 判斷的話，隔天證交所出同一天的資料時
+    # 會被當成「已經有了」而跳過 —— 上市那 1,090 檔永遠抓不到，
+    # 而且完全無聲無息，只會看到榜單停住。
+    done = set(db.complete_days(conn))
+    skip = latest in done and not a.force and not a.rebuild
     append_probe({
         "run_at_tpe": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "scheduled": a.scheduled or "手動",
@@ -254,6 +264,7 @@ def main(argv=None):
             ("本益比（兩市）", lambda: _valuations(conn, allow)),
             ("EPS 與財報", lambda: _eps(conn, allow)),
             ("月營收", lambda: _revenue(conn, allow)),
+            ("除權息", lambda: _dividends(conn, allow)),
             ("休市日曆", lambda: _holidays(conn))):
         log(f"抓{label}…")
         try:
@@ -291,8 +302,17 @@ def main(argv=None):
     ws.dump_benchmark(conn)
     ws.dump_latest(conn, d1)
     ws.dump_fundamental(conn)
+    log("算技術指標…")
+    ws.dump_technical(conn, progress=log)
     ws.dump_glossary()          # 名詞說明與本機 GUI 共用同一份
 
+    part2 = db.partial_days(conn)
+    if part2:
+        notes.append(
+            "；".join(f"{d} 目前只有{'上市' if m == 'twse' else '上櫃'}的資料"
+                      for d, m in part2)
+            + " —— 櫃買台北 16:00 就發布當日收盤，證交所要等隔天清晨，"
+              "所以傍晚到清晨之間會有半天的落差。等證交所補上就會自動完整。")
     miss = missing_days(conn, d1)
     if miss:
         log(f"⚠ 疑似漏掉 {len(miss)} 個交易日：{'、'.join(miss)}")
@@ -310,6 +330,27 @@ def main(argv=None):
     print(f"::notice::updated {d1}")
     conn.close()
     return 0
+
+
+def _dividends(conn, allow):
+    """除權息事件。★ 還原股價要用，不抓的話除息當天會變成假跌破訊號。
+
+    證交所只給股利金額、櫃買直接給除權息前後價 ——
+    兩種格式的差異由 core/technical.py 的 factors_all() 吸收。
+    """
+    out = []
+    for name, fn in (("上市", twse.fetch_dividends),
+                     ("上櫃", tpex.fetch_dividends)):
+        rows = [r for r in fn() if r[0] in allow]
+        conn.executemany(
+            "INSERT INTO dividend (stock_id,date,cash,stock_div,"
+            "before_px,after_px) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(stock_id,date) DO UPDATE SET "
+            "cash=excluded.cash, stock_div=excluded.stock_div, "
+            "before_px=COALESCE(excluded.before_px, dividend.before_px), "
+            "after_px=COALESCE(excluded.after_px, dividend.after_px)", rows)
+        out.append(f"{name} {len(rows)} 筆")
+    return "、".join(out)
 
 
 def _indices(conn):

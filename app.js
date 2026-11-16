@@ -120,6 +120,7 @@
             + esc(zh[b] || b) + '</button>';
     });
     html += '<button data-tab="fund">基本面</button>';
+    html += '<button data-tab="tech">技術面</button>';
     html += '<button data-tab="analysis">分析與選股</button>';
     html += '<button data-tab="about">說明</button>';
     $('#tabs').innerHTML = html;
@@ -153,10 +154,12 @@
     $('#board-view').hidden = v !== 'board';
     $('#analysis-view').hidden = v !== 'analysis';
     $('#fund-view').hidden = v !== 'fund';
+    $('#tech-view').hidden = v !== 'tech';
     $('#about-view').hidden = v !== 'about';
     if (v === 'board') renderBoard();
     if (v === 'analysis') renderAnalysis();
     if (v === 'fund') openFund();
+    if (v === 'tech') openTech();
     if (v === 'about') renderAbout();
     markTab();
   }
@@ -563,6 +566,143 @@
       S.fundQ = this.value;
       renderFund();
       var el = $('#fund-q');
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }
+
+  /* ---------------- 技術面 ---------------- */
+
+  function openTech() {
+    if (S.tech) { renderTech(); return; }
+    $('#tech-body').innerHTML = '<p class="muted">載入中…</p>';
+    get('data/technical.json').then(function (o) {
+      S.tech = o; renderTech();
+    }).catch(function (e) {
+      $('#tech-body').innerHTML =
+        '<p class="lag">技術指標載入失敗：' + esc(e.message) + '</p>';
+    });
+  }
+
+  /* 只顯示「算得出來」的欄位。
+     ★ 全是 null 的欄位不該排在表格裡 —— 那看起來像資料壞掉。
+     還沒到暖機期的指標改成列在上方，寫清楚還要幾個交易日。 */
+  function techCols(o) {
+    var ok = [], wait = [];
+    o.fields.forEach(function (f) {
+      if (f === 'stock_id') return;
+      var r = (o.ready || {})[f];
+      if (!r) { ok.push(f); return; }     /* close 沒有 ready 條目 */
+      if (r.ok) ok.push(f); else wait.push(f);
+    });
+    return { ok: ok, wait: wait };
+  }
+
+  function renderTech() {
+    var o = S.tech, nm = names();
+    var idx = {};
+    o.fields.forEach(function (f, i) { idx[f] = i; });
+    var cols = techCols(o);
+    var anyReady = (o.ready || {})[o.fields[2]];
+    var have = anyReady ? anyReady.have : 0;
+
+    var html = '<div class="card"><h2>技術面</h2>'
+      + '<p class="muted">從本站累積的官方價量算出來的衍生數值，'
+      + '可公開散布。價格為<b>還原股價</b>（已調整除權息），'
+      + '與看盤軟體上的成交價不同 —— 拿去對 K 線會對不上，那是正常的。</p>'
+      + '<dl class="kv">'
+      + '<dt>資料日期</dt><dd>' + esc(o.date || '—') + '</dd>'
+      + '<dt>累積天數</dt><dd>' + have + ' 個交易日</dd>'
+      + '</dl></div>';
+
+    if (cols.wait.length) {
+      html += '<div class="card"><h2>還沒到暖機期的指標</h2>'
+        + '<p class="muted">官方 API 不支援查詢過去的日期，所以歷史只能'
+        + '從本站上線那天開始一天一天累積，補不回來。'
+        + '資料不足時這裡<b>不顯示數字</b> —— 暖機期內擠出來的 RSI '
+        + '看起來正常，其實只是初始值的殘影，比留空更危險。</p>'
+        + '<div class="tablewrap"><table><thead><tr>'
+        + '<th>指標</th><th>最少需要</th><th>還差</th><th>真正穩定需要</th>'
+        + '</tr></thead><tbody>';
+      cols.wait.forEach(function (f) {
+        var r = o.ready[f];
+        html += '<tr><td>' + esc((o.zh || {})[f] || f) + '</td>'
+          + '<td class="num">' + r.need + ' 天</td>'
+          + '<td class="num"><b>' + Math.max(0, r.need - r.have)
+          + ' 天</b></td>'
+          + '<td class="num">' + r.stable + ' 天</td></tr>';
+      });
+      html += '</tbody></table></div></div>';
+    }
+
+    if (!cols.ok.length) {
+      html += '<div class="card"><p class="muted">目前還沒有任何指標'
+        + '累積到足夠的天數。</p></div>';
+      $('#tech-body').innerHTML = html;
+      return;
+    }
+
+    /* 排序欄位只取算得出來的那些 */
+    var sortF = S.techSort;
+    if (cols.ok.indexOf(sortF) < 0) sortF = cols.ok[0];
+    var dir = S.techDir === 'asc' ? 1 : -1;
+    var q = (S.techQ || '').trim();
+
+    var rows = o.rows.filter(function (r) {
+      if (!q) return true;
+      return r[0].indexOf(q) >= 0 || (nm[r[0]] || '').indexOf(q) >= 0;
+    });
+    var si = idx[sortF];
+    rows = rows.slice().sort(function (a, b) {
+      return cmpNum(a[si], b[si], dir);
+    });
+    var shown = rows.slice(0, 100);
+
+    html += '<div class="card"><div class="toolbar">'
+      + '<label>排序　<select id="tech-sort">';
+    cols.ok.forEach(function (f) {
+      html += '<option value="' + f + '"' + (f === sortF ? ' selected' : '')
+        + '>' + esc((o.zh || {})[f] || f) + '</option>';
+    });
+    html += '</select></label>'
+      + '<label>　<select id="tech-dir">'
+      + '<option value="desc"' + (dir < 0 ? ' selected' : '') + '>高 → 低</option>'
+      + '<option value="asc"' + (dir > 0 ? ' selected' : '') + '>低 → 高</option>'
+      + '</select></label>'
+      + '<label>　搜尋　<input id="tech-q" type="search" '
+      + 'placeholder="代號或名稱" value="' + esc(q) + '"></label>'
+      + '<span class="muted">　符合 ' + rows.length + ' 檔，顯示前 '
+      + shown.length + ' 檔</span></div>';
+
+    html += '<div class="tablewrap"><table><thead><tr><th>代號</th><th>名稱</th>';
+    cols.ok.forEach(function (f) {
+      html += '<th>' + esc((o.zh || {})[f] || f) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    shown.forEach(function (r) {
+      html += '<tr><td>' + esc(r[0]) + '</td><td>' + esc(nm[r[0]] || '') + '</td>';
+      cols.ok.forEach(function (f) {
+        var v = r[idx[f]];
+        if (v === null || v === undefined) { html += '<td class="num">—</td>'; }
+        else if (f === 'new_high' || f === 'new_low' || f === 'bull_stack') {
+          html += '<td class="num">' + (v ? '是' : '') + '</td>';
+        } else { html += '<td class="num">' + v + '</td>'; }
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+    $('#tech-body').innerHTML = html;
+
+    $('#tech-sort').addEventListener('change', function () {
+      S.techSort = this.value; renderTech();
+    });
+    $('#tech-dir').addEventListener('change', function () {
+      S.techDir = this.value; renderTech();
+    });
+    $('#tech-q').addEventListener('input', function () {
+      S.techQ = this.value;
+      renderTech();
+      var el = $('#tech-q');
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
     });

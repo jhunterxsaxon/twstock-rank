@@ -36,6 +36,7 @@ EP_INDEX = f"{BASE}/exchangeReport/MI_INDEX"
 EP_HOLIDAY = f"{BASE}/holidaySchedule/holidaySchedule"
 EP_PER = f"{BASE}/exchangeReport/BWIBBU_ALL"      # 本益比／殖利率／股價淨值比
 EP_EPS = f"{BASE}/opendata/t187ap14_L"            # 各年度 EPS 統計
+EP_DIVIDEND = f"{BASE}/exchangeReport/TWT48U_ALL"  # 除權息預告表
 EP_REVENUE = f"{BASE}/opendata/t187ap05_L"        # 每月營業收入彙總表
 
 SOURCE_CREDIT = "臺灣證券交易所"
@@ -238,6 +239,38 @@ def fetch_valuation():
                     netio.num(r.get("DividendYield")),
                     "twse"))
     return date, out
+
+
+def fetch_dividends():
+    """上市的除權息預告表。回傳 dividend 表的 rows。
+
+    端點 TWT48U_ALL（上市股票除權息預告表）是**前瞻**的 —— 列的是
+    即將到來的除權息日，所以每天抓就能把事件累積起來。
+
+    ★ 它沒有「除權息參考價」
+    櫃買的端點直接給除權息前收盤與參考價，證交所這支只給股利金額。
+    所以 before_px / after_px 留空，還原係數要在 adjust 時用
+    「我們自己的前一日收盤」加上股利金額去推算。
+
+    ★ 現在抓到的 53 筆幾乎全是 ETF（00401A、006208、00690…），
+    而 ETF 不在白名單裡。真正的上市個股會在各自的除權息日前出現在這裡。
+
+    欄位：Date、Code、Name、Exdividend（除權息類型）、
+          StockDividendRatio（股票股利，實測目前皆空）、CashDividend。
+    """
+    data = netio.get_json(EP_DIVIDEND, limiter=_limiter)
+    out = []
+    for r in data:
+        sid = str(r.get("Code") or "").strip()
+        d = netio.roc_to_iso(r.get("Date"))
+        if not sid or not d:
+            continue
+        cash = netio.num(r.get("CashDividend"))
+        stock = netio.num(r.get("StockDividendRatio"))
+        if cash is None and stock is None:
+            continue
+        out.append((sid, d, cash, stock, None, None))
+    return out
 
 
 def fetch_holidays():
