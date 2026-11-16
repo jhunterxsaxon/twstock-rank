@@ -24,11 +24,20 @@ name: 每日抓取台股資料
 # 舊排程加上 GitHub 的延遲後落在台北 21:30~05:30，剛好全部卡在
 # 資料出現的前一刻 —— 8 次排程只有 1 次產生 commit，命中率 12.5%。
 #
-# ★ 為什麼改成每 2 小時而不是「改排早上 7 點」
+# ★ 為什麼是每小時，而不是「改排早上 7 點」
 # GitHub 的排程延遲是 0~7 小時且不可控（1151022s-1 實測平均 3.1 小時、
 # 最糟 6.9 小時），任何單一時間點都會被打散，沒有一個設法能穩定命中。
-# 密集排程才是可靠解：沒有新資料時 fetch.py 只打 1 個端點就結束，
+# 密集排程才是可靠解：沒有新資料時 fetch.py 只打 2 個端點就結束，
 # 實測耗時 3 秒；公開 repo 的 Actions 分鐘數不計費，成本可以忽略。
+#
+# ★★ 每小時還有第二個目的：量出官方到底幾點更新 ★★
+# fetch.py 每次執行都會往 data/probe_log.csv 追加一行，
+# **包含沒有新資料的那些**。記的是「幾點探測、看到哪一天的資料、
+# 那個檔案是幾點生成的（last-modified）」。
+#
+# 原本只有命中才 commit，所以否定樣本全部消失，窗口才會寬到 32 分鐘。
+# 有了每小時的連續紀錄，幾天之後就能把更新時間夾到幾分鐘之內，
+# 到時候再決定要不要把頻率降回來。
 #
 # ★ 為什麼拿掉 1-5（只跑週一到週五）
 # 週五收盤的資料要到**週六清晨**才出現，而週六不跑 —— 這就是
@@ -45,7 +54,7 @@ name: 每日抓取台股資料
 
 on:
   schedule:
-    - cron: '17 */2 * * *'      # 每 2 小時，每天（UTC）
+    - cron: '17 * * * *'        # 每小時，每天（UTC）。:17 避開整點尖峰
   workflow_dispatch:            # 也可以手動觸發
     inputs:
       force:
@@ -100,9 +109,16 @@ jobs:
             echo "資料沒有變動，不 commit"
             exit 0
           fi
-          DATE=$(python -c "import json;print(json.load(open('data/meta.json'))['data_date'])")
+          # 只有探測紀錄變動 = 這次是空跑，用不同的 commit 訊息，
+          # 這樣 git log 一眼就分得出「真的有新資料」和「只是探測」
+          if git diff --quiet --exit-code -- data/ ':(exclude)data/probe_log.csv'; then
+            MSG="探測紀錄 $(date '+%Y-%m-%d %H:%M')"
+          else
+            DATE=$(python -c "import json;print(json.load(open('data/meta.json'))['data_date'])")
+            MSG="資料更新 ${DATE}"
+          fi
           git add data/
-          git commit -m "資料更新 ${DATE}"
+          git commit -m "${MSG}"
           # 排程理論上被 concurrency 擋開了，但遠端若有新 commit
           # 還是要先 rebase，否則 push 會被拒
           git pull --rebase --autostash origin ${{ github.ref_name }} || true

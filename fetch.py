@@ -30,11 +30,15 @@ FinMind 四個方案全部禁止再散布原始資料，而且無 token 的額�
     python fetch.py --rebuild       重算所有歷史榜單後再匯出
 """
 import argparse
+import csv
+import json
 import os
 import sqlite3
 import sys
 import traceback
-from datetime import date, datetime, timedelta
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 from core import db, netio, ranking, tpex, twse, universe, webstore as ws
 
@@ -64,17 +68,61 @@ def open_db():
     return conn
 
 
-def peek_latest_date():
-    """只打一個端點，看官方最新的交易日是哪天。
+PROBE_LOG = os.path.join("data", "probe_log.csv")
+PROBE_COLS = ("run_at_tpe", "scheduled", "twse_date", "twse_modified_tpe",
+              "tpex_date", "tpex_modified_tpe", "action")
 
-    ★ 這是「要不要做事」的判斷依據，成本只有 1 次請求。
-    22:30 的保險排程靠它決定要不要繼續 —— 沒有新資料就立刻結束，
-    不會產生空的 commit。
+
+def _gmt_to_tpe(s):
+    """把 HTTP 的 Last-Modified（GMT）轉成台北時間。"""
+    if not s:
+        return ""
+    try:
+        d = parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        return ""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone(timedelta(hours=8))).strftime(
+        "%Y-%m-%d %H:%M:%S")
+
+
+def probe(url):
+    """打一個端點，同時取回「資料日期」與「這個檔案幾點生成」。
+
+    ★ last-modified 才是關鍵
+    只看內容的日期，知道的是「現在是哪一天的資料」，不知道它何時變成這樣。
+    官方的檔案帶 last-modified，直接說出那個檔案是幾點生成的。
+    實測 2026-11-16：證交所 143 支端點全部在台北 05:20~05:29 同一批次生成，
+    櫃買則是 14:00 —— 這是推不出來、只能讀標頭才知道的事。
     """
-    data = netio.get_json(twse.EP_PRICE)
-    if not data:
-        return None
-    return netio.roc_to_iso(data[0].get("Date"))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": netio.UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60,
+                                context=netio._ssl_context()) as r:
+        lm = r.headers.get("last-modified", "")
+        data = json.loads(r.read().decode("utf-8-sig"))
+    d = netio.roc_to_iso(data[0].get("Date")) if data else None
+    return d, _gmt_to_tpe(lm)
+
+
+def append_probe(row):
+    """★ 空跑也要留下痕跡
+
+    原本只有「抓到新資料」才 commit，所以沒命中的執行完全沒有紀錄 ——
+    結果是只看得到成功的那幾次，官方更新時間的窗口因此寬到 32 分鐘，
+    還是用手動觸發才湊巧夾到的。
+
+    這份 CSV 每次執行都會多一行，不管有沒有新資料。有了否定樣本，
+    才夾得出官方實際幾點更新。
+    """
+    new = not os.path.exists(PROBE_LOG)
+    os.makedirs(os.path.dirname(PROBE_LOG), exist_ok=True)
+    with open(PROBE_LOG, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        if new:
+            w.writerow(PROBE_COLS)
+        w.writerow([row.get(c, "") for c in PROBE_COLS])
 
 
 def missing_days(conn, latest):
@@ -127,19 +175,32 @@ def main(argv=None):
 
     log("查官方最新交易日…")
     try:
-        latest = peek_latest_date()
+        latest, twse_lm = probe(twse.EP_PRICE)
     except Exception as e:
         log(f"✖ 連線失敗：{e}")
         traceback.print_exc()
         return 1
-    log(f"  官方目前提供 {latest}")
+    try:
+        tpex_date, tpex_lm = probe(tpex.EP_PRICE)
+    except Exception as e:
+        tpex_date, tpex_lm = None, ""
+        log(f"  （上櫃探測失敗，不影響判斷：{e}）")
+    log(f"  上市 {latest}　檔案生成於 {twse_lm or '（未提供）'}")
+    log(f"  上櫃 {tpex_date}　檔案生成於 {tpex_lm or '（未提供）'}")
     # ★ 這裡原本每次都會寫一條「官方資料仍停在 X（今天是 Y）」的註記。
     # 但官方是隔天清晨才發布，latest 永遠不可能等於今天 —— 等於每跑必出，
     # 結果就是網頁上的警告區永遠有東西，真正要緊的警告（漏掉交易日、
     # 榜單鑑別度不足）反而被稀釋掉。改由 meta 的 age_days 表達落後幾天。
 
-    if latest in have and not a.force and not a.rebuild:
-        log(f"  {latest} 的資料已經有了，沒有新東西 → 結束，不產生 commit")
+    skip = latest in have and not a.force and not a.rebuild
+    append_probe({
+        "run_at_tpe": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scheduled": a.scheduled or "手動",
+        "twse_date": latest or "", "twse_modified_tpe": twse_lm,
+        "tpex_date": tpex_date or "", "tpex_modified_tpe": tpex_lm,
+        "action": "skip" if skip else "fetch"})
+    if skip:
+        log(f"  {latest} 的資料已經有了 → 結束（探測紀錄已留存）")
         print("::notice::no-new-data")
         return 0
 
