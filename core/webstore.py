@@ -155,12 +155,22 @@ def load_into_db(conn, limit_months=None):
 
     for ym in months("boards"):
         obj = load_month("boards", ym)
-        for date, boards in (obj.get("days") or {}).items():
-            for board, rows in boards.items():
-                conn.executemany(
-                    "INSERT OR REPLACE INTO rank_daily "
-                    "(date,board,stock_id,rank,metric) VALUES (?,?,?,?,?)",
-                    [(date, board, r[0], r[1], r[2]) for r in rows])
+        for date, day in (obj.get("days") or {}).items():
+            # ★ 辨識新舊格式：
+            #   舊 {board: rows}            -> 全部當成 'all'
+            #   新 {market: {board: rows}}  -> 照實載入
+            #   'all'/'twse'/'tpex' 不會和榜單代號撞名，所以判斷是明確的。
+            if set(day) & {"all", "twse", "tpex"}:
+                per_market = day
+            else:
+                per_market = {"all": day}
+            for mk, boards in per_market.items():
+                for board, rows in boards.items():
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO rank_daily "
+                        "(date,board,market,stock_id,rank,metric) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [(date, board, mk, r[0], r[1], r[2]) for r in rows])
 
     bm = read(_p("benchmark.json"), default={})
     for code, series in (bm.get("series") or {}).items():
@@ -218,19 +228,39 @@ def dump_month_prices(conn, ym):
 
 
 def dump_month_boards(conn, ym):
+    """每月的榜單，**三個範圍各存一份**（全市場／上市／上櫃）。
+
+    ★ 格式從 {date: {board: rows}} 變成 {date: {market: {board: rows}}}。
+    舊檔案沒有 market 那一層，`load_into_db()` 會自動辨識並當成 'all'。
+
+    ★ 為什麼歷史也要存 per-market
+    這個 repo 的 SQLite 是 **:memory:**，每次執行都從 JSON 重建 ——
+    沒寫進 JSON 的東西下次就不存在。per-market 的「連續在榜天數」
+    需要 per-market 的歷史，不存就永遠是 1 天。
+
+    ★ 體積
+    月檔會變成約三倍（326 KB -> 約 1 MB）。這不影響網頁載入速度：
+    瀏覽器只載 meta / latest / glossary / universe 四個檔，
+    月檔是 Actions 重建資料庫時用的。
+    """
     from core import ranking
     obj = {"ym": ym, "fields": BOARD_FIELDS, "store_n": ranking.STORE_N,
-           "days": {}}
+           "markets": list(ranking.MARKETS), "days": {}}
     for date, in conn.execute(
             "SELECT DISTINCT date FROM rank_daily WHERE date LIKE ? "
             "ORDER BY date", (ym + "%",)):
         day = {}
-        for board in ranking.BOARDS:
-            rows = [[r[0], r[1], r[2]] for r in conn.execute(
-                "SELECT stock_id,rank,metric FROM rank_daily "
-                "WHERE date=? AND board=? ORDER BY rank", (date, board))]
-            if rows:
-                day[board] = rows
+        for mk in ranking.MARKETS:
+            per = {}
+            for board in ranking.BOARDS:
+                rows = [[r[0], r[1], r[2]] for r in conn.execute(
+                    "SELECT stock_id,rank,metric FROM rank_daily "
+                    "WHERE date=? AND board=? AND market=? ORDER BY rank",
+                    (date, board, mk))]
+                if rows:
+                    per[board] = rows
+            if per:
+                day[mk] = per
         if day:
             obj["days"][date] = day
     return save_month("boards", ym, obj)
@@ -271,6 +301,45 @@ def dump_latest(conn, date):
         "boards": boards, "gone": marks,
         "price_fields": PRICE_FIELDS, "prices": px,
         "valuation_fields": VAL_FIELDS, "valuations": val,
+    })
+
+
+def dump_markets(conn, date):
+    """上市／上櫃各自的榜單，**獨立一個檔、延後載入**。
+
+    ★ 為什麼不塞進 latest.json
+    latest.json 已經 217 KB，首次載入（meta+latest+glossary+universe）
+    約 359 KB，而 check_web 盯著 500 KB 的上限。
+    把三個範圍都塞進去會直接超標 —— 首次載入量是這個網站少數幾個
+    一旦變大就回不去的指標。
+
+    所以 latest.json 維持只放全市場（前端契約不變），
+    切到市場篩選時才載這個檔。和基本面、技術面同一個模式。
+    """
+    from core import ranking
+    out, gone = {}, {}
+    for mk in ("twse", "tpex"):
+        b, g = {}, {}
+        for board in ranking.BOARDS:
+            rows, gn = ranking.marked(conn, board, date,
+                                      top_n=ranking.STORE_N, market=mk)
+            b[board] = [
+                [r["stock_id"], r["rank"], r["metric"], r["streak"],
+                 1 if r["is_new"] else 0, 1 if r["is_back"] else 0,
+                 r["move"] if r["move"] is not None else None]
+                for r in rows]
+            g[board] = [[x["stock_id"], x["prev_rank"]] for x in gn]
+        out[mk] = b
+        gone[mk] = g
+    return write(_p("markets.json"), {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "date": date,
+        "board_fields": ["stock_id", "rank", "metric", "streak",
+                         "is_new", "is_back", "move"],
+        "market_zh": ranking.MARKET_ZH,
+        "boards": out, "gone": gone,
+        "note": "上市與上櫃各自排名。全市場榜單在 latest.json，"
+                "這個檔只有切到市場篩選時才載入。",
     })
 
 

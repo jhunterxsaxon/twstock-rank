@@ -60,12 +60,13 @@ CREATE INDEX IF NOT EXISTS ix_price_date ON price_daily(date);
 CREATE TABLE IF NOT EXISTS rank_daily (
   date     TEXT NOT NULL,
   board    TEXT NOT NULL,
+  market   TEXT NOT NULL DEFAULT 'all',   -- 'all' 全市場 | 'twse' | 'tpex'
   stock_id TEXT NOT NULL,
   rank     INTEGER NOT NULL,
   metric   REAL,           -- 該榜的排序值
-  PRIMARY KEY (date, board, stock_id)
+  PRIMARY KEY (date, board, market, stock_id)
 );
-CREATE INDEX IF NOT EXISTS ix_rank_bs ON rank_daily(board, stock_id, date);
+CREATE INDEX IF NOT EXISTS ix_rank_bs ON rank_daily(board, market, stock_id, date);
 
 -- ============ 融資融券（單位：張） ============
 CREATE TABLE IF NOT EXISTS margin_daily (
@@ -253,6 +254,29 @@ def _migrate(conn):
     if "chg" not in cols:
         conn.execute("ALTER TABLE price_daily ADD COLUMN chg REAL")
 
+    # ★ rank_daily 的主鍵要加上 market，而 SQLite 不能用 ALTER 改主鍵，
+    #   只能整張重建。既有的列全部是全市場的結果，所以填 'all'。
+    #   per-market 的列會在下次重算榜單時產生。
+    rcols = {r[1] for r in conn.execute("PRAGMA table_info(rank_daily)")}
+    if rcols and "market" not in rcols:
+        conn.executescript("""
+            CREATE TABLE rank_daily__new (
+              date     TEXT NOT NULL,
+              board    TEXT NOT NULL,
+              market   TEXT NOT NULL DEFAULT 'all',
+              stock_id TEXT NOT NULL,
+              rank     INTEGER NOT NULL,
+              metric   REAL,
+              PRIMARY KEY (date, board, market, stock_id)
+            );
+            INSERT INTO rank_daily__new
+              SELECT date, board, 'all', stock_id, rank, metric FROM rank_daily;
+            DROP TABLE rank_daily;
+            ALTER TABLE rank_daily__new RENAME TO rank_daily;
+            CREATE INDEX IF NOT EXISTS ix_rank_bs
+              ON rank_daily(board, market, stock_id, date);
+        """)
+
 
 def backup(path=None):
     """寫入前備份，檔名帶時間戳。回傳備份檔路徑（沒有原檔則回 None）。"""
@@ -371,7 +395,7 @@ def upsert_stock(conn, rows):
     return len(rows)
 
 
-def replace_ranks(conn, date, board, rows):
+def replace_ranks(conn, date, board, rows, market="all"):
     """寫入某一天某一張榜。
 
     ★ `rows` 的格式是 **[(stock_id, metric), ...]，而且必須已經排好序**。
@@ -382,10 +406,13 @@ def replace_ranks(conn, date, board, rows):
     先刪再寫，因為榜單是「當天的完整排名」—— 如果重抓時某檔掉出榜外，
     只做 UPSERT 會讓它留在表裡，變成已經掉榜卻還在榜上的鬼資料。
     """
-    conn.execute("DELETE FROM rank_daily WHERE date=? AND board=?", (date, board))
+    conn.execute("DELETE FROM rank_daily WHERE date=? AND board=? AND market=?",
+                 (date, board, market))
     conn.executemany(
-        "INSERT INTO rank_daily (date,board,stock_id,rank,metric) VALUES (?,?,?,?,?)",
-        [(date, board, sid, i + 1, m) for i, (sid, m) in enumerate(rows)])
+        "INSERT INTO rank_daily (date,board,market,stock_id,rank,metric) "
+        "VALUES (?,?,?,?,?,?)",
+        [(date, board, market, sid, i + 1, m)
+         for i, (sid, m) in enumerate(rows)])
     return len(rows)
 
 

@@ -102,6 +102,7 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
     prev = conn.execute(
         "SELECT MAX(date) FROM price_daily WHERE date < ?", (date,)).fetchone()[0]
 
+    mkt = _market_of(conn)
     px = {}
     for sid, o, h, lo, c, v, a, chg in conn.execute(
             "SELECT stock_id, open, high, low, close, volume, amount, chg "
@@ -121,12 +122,12 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
     # ---- 成交量榜 ----
     rows = [(sid, d[4]) for sid, d in px.items() if d[4] > 0]
     rows.sort(key=lambda x: -x[1])
-    out["volume"] = _write(conn, date, "volume", rows)
+    out["volume"] = _write(conn, date, "volume", rows, mkt)
 
     # ---- 成交金額榜 ----
     rows = [(sid, d[5]) for sid, d in px.items() if d[5] > 0]
     rows.sort(key=lambda x: -x[1])
-    out["amount"] = _write(conn, date, "amount", rows)
+    out["amount"] = _write(conn, date, "amount", rows, mkt)
 
     # ---- 漲幅榜／跌幅榜 ----
     # ★ 用官方的漲跌價差，不用 (收盤 − 前日收盤) 自己算。
@@ -153,8 +154,8 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
     ups.sort(key=lambda x: -x[1])
     # 跌幅榜由跌最多排到跌最少，所以是「由小到大」
     downs.sort(key=lambda x: x[1])
-    out["change_up"] = _write(conn, date, "change_up", ups)
-    out["change_down"] = _write(conn, date, "change_down", downs)
+    out["change_up"] = _write(conn, date, "change_up", ups, mkt)
+    out["change_down"] = _write(conn, date, "change_down", downs, mkt)
 
     # ---- 振幅榜 ----
     rows = []
@@ -168,7 +169,7 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
             continue                       # 流動性門檻
         rows.append((sid, (h - lo) / pc * 100.0))
     rows.sort(key=lambda x: -x[1])
-    out["swing"] = _write(conn, date, "swing", rows)
+    out["swing"] = _write(conn, date, "swing", rows, mkt)
 
     # ---- 三大法人榜（金額 = 買賣超股數 × 當日收盤） ----
     chips = []
@@ -182,16 +183,45 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
         chips.append((sid, net * c))
     buy = sorted([x for x in chips if x[1] > 0], key=lambda x: -x[1])
     sell = sorted([x for x in chips if x[1] < 0], key=lambda x: x[1])
-    out["chip_buy"] = _write(conn, date, "chip_buy", buy)
-    out["chip_sell"] = _write(conn, date, "chip_sell", sell)
+    out["chip_buy"] = _write(conn, date, "chip_buy", buy, mkt)
+    out["chip_sell"] = _write(conn, date, "chip_sell", sell, mkt)
 
     return out
 
 
-def _write(conn, date, board, rows):
-    # 一律存到 STORE_N，顯示時再切（見檔案開頭的說明）
+MARKETS = ("all", "twse", "tpex")
+MARKET_ZH = {"all": "全市場", "twse": "上市", "tpex": "上櫃"}
+
+
+def _market_of(conn):
+    """{stock_id: 'twse'|'tpex'}。"""
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT stock_id, market FROM stock")}
+
+
+def _write(conn, date, board, rows, mkt=None):
+    """寫入某張榜的三個範圍：全市場、上市、上櫃。
+
+    ★ `rows` 必須是**已經排好序的全市場清單**。
+
+    ★ 為什麼可以直接篩選，不用重新排序
+    「過濾不改變順序」——把全市場的排序結果篩出單一市場再重新編號，
+    **就等於該市場自己排名的結果**（排序依據是同一個 metric）。
+    所以這裡不需要、也不應該另外寫一套排序邏輯：多一套就會分岔。
+
+    ★ 為什麼不靠前端過濾
+    全市場前 300 名裡上市佔 242 檔，但**上櫃只有 58 檔** ——
+    前端拿 latest.json 過濾做不出上櫃前 100 名。
+    """
     from core import db
-    return db.replace_ranks(conn, date, board, rows[:STORE_N])
+    if mkt is None:
+        mkt = _market_of(conn)
+    n = db.replace_ranks(conn, date, board, rows[:STORE_N], market="all")
+    for m in ("twse", "tpex"):
+        db.replace_ranks(conn, date, board,
+                         [r for r in rows if mkt.get(r[0]) == m][:STORE_N],
+                         market=m)
+    return n
 
 
 def _whitelist(conn):
@@ -200,14 +230,14 @@ def _whitelist(conn):
 
 # ---------------- 在榜標記 ----------------
 
-def board_days(conn, board):
+def board_days(conn, board, market="all"):
     """這張榜有資料的日期（升冪）。"""
     return [r[0] for r in conn.execute(
-        "SELECT DISTINCT date FROM rank_daily WHERE board=? ORDER BY date",
-        (board,))]
+        "SELECT DISTINCT date FROM rank_daily WHERE board=? AND market=? "
+        "ORDER BY date", (board, market))]
 
 
-def marked(conn, board, date, top_n=None):
+def marked(conn, board, date, top_n=None, market="all"):
     """某天某榜的完整內容，附標記。
 
     ★ `top_n` 是**顯示深度**。連續天數／新進榜／回榜／掉榜全部按這個深度
@@ -233,21 +263,22 @@ def marked(conn, board, date, top_n=None):
     DISTINCT date，所以週末與國定假日自然不算斷。
     """
     n = int(top_n or TOP_N.get(board, 100))
-    days = board_days(conn, board)
+    days = board_days(conn, board, market)
     if date not in days:
         return [], []
     i = days.index(date)
 
     today = dict(conn.execute(
         "SELECT stock_id, rank FROM rank_daily WHERE board=? AND date=? "
-        "AND rank <= ?", (board, date, n)))
+        "AND market=? AND rank <= ?", (board, date, market, n)))
     metrics = dict(conn.execute(
         "SELECT stock_id, metric FROM rank_daily WHERE board=? AND date=? "
-        "AND rank <= ?", (board, date, n)))
+        "AND market=? AND rank <= ?", (board, date, market, n)))
     prev_day = days[i - 1] if i > 0 else None
     prev = dict(conn.execute(
         "SELECT stock_id, rank FROM rank_daily WHERE board=? AND date=? "
-        "AND rank <= ?", (board, prev_day, n))) if prev_day else {}
+        "AND market=? AND rank <= ?",
+        (board, prev_day, market, n))) if prev_day else {}
 
     # 當日成員的完整在榜歷史，一次撈完（避免逐檔 query，也避免視窗截斷）
     # ★ 這裡也要帶 rank <= n —— 否則「連續在榜」會算成「連續在前 300 名」，
@@ -258,8 +289,8 @@ def marked(conn, board, date, top_n=None):
         qs = ",".join("?" * len(members))
         for sid, d in conn.execute(
                 f"SELECT stock_id, date FROM rank_daily WHERE board=? "
-                f"AND rank <= ? AND stock_id IN ({qs})",
-                (board, n, *members)):
+                f"AND market=? AND rank <= ? AND stock_id IN ({qs})",
+                (board, market, n, *members)):
             on.setdefault(sid, set()).add(d)
 
     names = {r[0]: r[1] for r in conn.execute("SELECT stock_id, name FROM stock")}
@@ -308,8 +339,11 @@ def selectivity(conn, board):
     """
     n = TOP_N.get(board, 100)
     r = conn.execute(
+        # ★ 加了 market 維度之後，這裡一定要限定 'all'，
+        #   否則三個範圍會被一起數進去，上榜比例直接變成三倍。
         "SELECT AVG(c) FROM (SELECT date, COUNT(*) c FROM rank_daily "
-        "WHERE board=? AND rank <= ? GROUP BY date)", (board, n)).fetchone()
+        "WHERE board=? AND market='all' AND rank <= ? GROUP BY date)",
+        (board, n)).fetchone()
     members = r[0] if r and r[0] else 0
     r2 = conn.execute(
         "SELECT AVG(n) FROM (SELECT date, COUNT(*) n FROM price_daily "
@@ -334,7 +368,7 @@ def selectivity_warning(conn):
             f"python run_history.py --prices")
 
 
-def streak_series(conn, board, stock_id, top_n=None):
+def streak_series(conn, board, stock_id, top_n=None, market="all"):
     """某檔在某榜的「連續在榜天數」時間序列，供指標與回測使用。
 
     回傳 {date: streak}。只在它在榜的日子有值。
@@ -344,10 +378,10 @@ def streak_series(conn, board, stock_id, top_n=None):
     ★ `top_n` 同 `marked()`：連續天數的定義取決於榜單深度。
     """
     n = int(top_n or TOP_N.get(board, 100))
-    days = board_days(conn, board)
+    days = board_days(conn, board, market)
     on = {r[0] for r in conn.execute(
-        "SELECT date FROM rank_daily WHERE board=? AND stock_id=? AND rank <= ?",
-        (board, stock_id, n))}
+        "SELECT date FROM rank_daily WHERE board=? AND stock_id=? "
+        "AND market=? AND rank <= ?", (board, stock_id, market, n))}
     out, run = {}, 0
     for d in days:
         if d in on:

@@ -416,6 +416,7 @@ def main(argv=None):
             ws.dump_month_boards(conn, ym)
     ws.dump_benchmark(conn)
     ws.dump_latest(conn, rank_date)
+    ws.dump_markets(conn, rank_date)
     ws.dump_fundamental(conn)
     log("算技術指標…")
     ws.dump_technical(conn, progress=log)

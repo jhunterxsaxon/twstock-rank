@@ -169,14 +169,43 @@
   /* ---------------- 榜單 ---------------- */
 
   function boardRows() {
-    /* latest.json 的欄位：
-       [stock_id, rank, metric, streak, is_new, is_back, move]
-       ★ streak / is_new / move 是用 store_n（300）算的。
-         使用者把顯示名次調小時，必須重算 —— 「連續在前 50 名 5 天」
-         和「連續在前 100 名 5 天」是兩件不同的事。
-         所以淺層的切換要回頭看歷史，見 recompute()。*/
-    var raw = (S.latest.boards || {})[S.board] || [];
+    /* 欄位：[stock_id, rank, metric, streak, is_new, is_back, move]
+
+       ★ 已知限制：streak / is_new / move 是用 store_n（300）算的，
+         使用者把顯示名次調小時**不會重算**。所以「連續在榜 5 天」
+         實際的意思是「連續在前 300 名 5 天」，不是「連續在前 50 名」。
+         （舊註解寫「見 recompute()」，但那個函式從來沒有實作過 ——
+          那是會誤導人的註解，改成實話。）
+
+       ★ 全市場的榜在 latest.json（首次就載），
+         上市／上櫃的榜在 markets.json（切過去才載）。*/
+    var src = (S.market === 'all')
+      ? (S.latest.boards || {})
+      : (((S.markets || {}).boards || {})[S.market] || {});
+    var raw = src[S.board] || [];
     return raw.filter(function (r) { return r[1] <= S.topN; });
+  }
+
+  function goneRows() {
+    var src = (S.market === 'all')
+      ? (S.latest.gone || {})
+      : (((S.markets || {}).gone || {})[S.market] || {});
+    return src[S.board] || [];
+  }
+
+  /* 延後載入 markets.json（約 89 KB）。
+     ★ 不跟 latest.json 綁在一起：首次載入量目前 359 KB，
+       上限 500 KB，而且那是一旦變大就回不去的指標。 */
+  function ensureMarkets(cb) {
+    if (S.market === 'all' || S.markets) { cb(); return; }
+    get('data/markets.json').then(function (o) {
+      S.markets = o;
+      cb();
+    }).catch(function (e) {
+      S.markets = { boards: {}, gone: {} };
+      console.error('markets.json 載入失敗', e);
+      cb();
+    });
   }
 
   function names() { return S.universe || {}; }
@@ -225,7 +254,7 @@
     $('#board-table tbody').innerHTML = html || emptyMsg();
 
     var gone = (S.gone.length ? S.gone
-                : ((S.latest.gone || {})[S.board] || []))
+                : goneRows())
       .filter(function (g) { return g[1] <= S.topN; });
     $('#gone-count').textContent = '（' + gone.length + ' 檔）';
     $('#gone-table tbody').innerHTML = gone.map(function (g) {
@@ -833,6 +862,7 @@
       Object.keys(r[3].stocks || {}).forEach(function (k) {
         S.universe[k] = r[3].stocks[k][0];
       });
+      S.market = 'all';
       S.board = (S.meta.boards || ['volume'])[0];
       S.topN = (S.meta.top_n || {})[S.board] || 100;
       $('#top-sel').value = String(S.topN);
@@ -853,6 +883,11 @@
     $('#top-sel').addEventListener('change', function () {
       S.topN = parseInt(this.value, 10) || 100;
       renderBoard();
+    });
+    $('#mkt-sel').addEventListener('change', function () {
+      S.market = this.value;
+      /* 切到上市／上櫃時才去載 markets.json，載完再畫。 */
+      ensureMarkets(function () { renderBoard(); renderLegend(); });
     });
     $('#btn-codes').addEventListener('click', copyCodes);
     $('#btn-csv').addEventListener('click', downloadCsv);
