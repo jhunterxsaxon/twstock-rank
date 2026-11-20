@@ -273,8 +273,25 @@ def main(argv=None):
     # 只含上櫃的 `latest`。用 have 判斷的話，隔天證交所出同一天的資料時
     # 會被當成「已經有了」而跳過 —— 上市那 1,090 檔永遠抓不到，
     # 而且完全無聲無息，只會看到榜單停住。
-    done = set(db.complete_days(conn))
-    skip = latest in done and not a.force and not a.rebuild
+    # ★★ 要不要抓，看的是「任一市場有我們還沒有的日期」★★
+    #
+    # 原本寫 `latest in db.complete_days(conn)`，而 latest 來自 **openapi**
+    # （T+1）。上市來源換成開放資料平臺之後，這個判斷每次都會說
+    # 「11-19 已經有了 → 結束」，當日資料永遠抓不到 —— 換來源等於白換。
+    #
+    # 而且它把兩件事混在一起：「這個日期完整嗎」和「有沒有新東西可抓」。
+    # 兩市發布時間差兩小時，必須逐市場看：
+    #     上市有 11-20 但我們只有到 11-19  -> 抓
+    #     上櫃有 11-20 但我們只有到 11-19  -> 抓
+    #     兩邊都沒有新的                   -> 跳過
+    # 這樣 14:00~16:00 會先抓到上市那半，16:00 之後再補上櫃。
+    twse_new = bool(od_date) and od_date not in db.market_dates(conn, "twse")
+    tpex_new = bool(tpex_date) and tpex_date not in db.market_dates(conn, "tpex")
+    skip = not (twse_new or tpex_new) and not a.force and not a.rebuild
+    if twse_new or tpex_new:
+        log(f"  有新資料：{'上市 ' + od_date if twse_new else ''}"
+            f"{'　' if twse_new and tpex_new else ''}"
+            f"{'上櫃 ' + tpex_date if tpex_new else ''}")
     append_probe({
         "run_at_tpe": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "scheduled": a.scheduled or "手動",
@@ -284,7 +301,8 @@ def main(argv=None):
         "opendata_twse_modified_tpe": od_lm,
         "action": "skip" if skip else "fetch"})
     if skip:
-        log(f"  {latest} 的資料已經有了 → 結束（探測紀錄已留存）")
+        log(f"  兩市都沒有新資料（上市 {od_date or latest}、上櫃 {tpex_date}）"
+            f" → 結束（探測紀錄已留存）")
         print("::notice::no-new-data")
         return 0
 

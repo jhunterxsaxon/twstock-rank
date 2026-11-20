@@ -434,6 +434,19 @@ def complete_days(conn):
         "GROUP BY p.date ORDER BY p.date") if n >= 2]
 
 
+def market_dates(conn, market):
+    """某個市場已經有行情的日期集合。
+
+    ★ 用途：判斷「有沒有新東西可抓」。
+    兩市發布時間不同步（上市約 14:00、上櫃 16:00），所以不能用單一的
+    「最新完整日」來決定 —— 那會讓先發布的那一邊一直抓不到。
+    """
+    return {r[0] for r in conn.execute(
+        "SELECT DISTINCT p.date FROM price_daily p "
+        "JOIN stock s ON s.stock_id = p.stock_id WHERE s.market = ?",
+        (market,))}
+
+
 def partial_days(conn):
     """只有單一市場的交易日 —— 要顯示出來，不能靜靜放著。"""
     return [(d, m) for d, m, n in conn.execute(
