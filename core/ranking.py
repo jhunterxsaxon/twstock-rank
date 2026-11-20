@@ -39,7 +39,8 @@
 不需要維護行事曆，而且永遠不會跟實際資料不一致。
 """
 
-BOARDS = ["volume", "amount", "swing", "chip_buy", "chip_sell"]
+BOARDS = ["volume", "amount", "change_up", "change_down", "swing",
+          "chip_buy", "chip_sell"]
 
 # ★★ 儲存深度與顯示深度是兩回事 ★★
 #
@@ -56,6 +57,8 @@ STORE_N = 300
 TOP_N = {
     "volume": 100,
     "amount": 100,
+    "change_up": 100,
+    "change_down": 100,
     "swing": 100,
     "chip_buy": 50,
     "chip_sell": 50,
@@ -67,6 +70,8 @@ TOP_CHOICES = [10, 20, 30, 50, 100, 150, 200, 300]
 BOARD_ZH = {
     "volume": "成交量榜",
     "amount": "成交金額榜",
+    "change_up": "漲幅榜",
+    "change_down": "跌幅榜",
     "swing": "振幅榜",
     "chip_buy": "三大法人買超榜",
     "chip_sell": "三大法人賣超榜",
@@ -74,6 +79,16 @@ BOARD_ZH = {
 
 # 振幅榜的流動性門檻：成交金額至少 1,000 萬元
 SWING_MIN_AMOUNT = 10_000_000
+
+# ★ 漲跌幅榜需要官方漲跌價差（chg），而它是 2026-11-20 才開始存的欄位，
+#   歷史資料沒有。覆蓋率不足時**整張榜留空**，不要出半套的榜。
+#
+#   空榜在畫面上是「沒有資料」，半套的榜是「看起來正常但少了一半」——
+#   後者糟得多，因為沒有人會發現。
+#
+#   門檻訂 80%：正常情況下兩市幾乎每檔都有 chg（少數停牌股沒有），
+#   實測一天只有單邊有資料時是 44%，會被正確擋下。
+CHG_MIN_COVERAGE = 0.8
 
 
 def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
@@ -88,11 +103,11 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
         "SELECT MAX(date) FROM price_daily WHERE date < ?", (date,)).fetchone()[0]
 
     px = {}
-    for sid, o, h, lo, c, v, a in conn.execute(
-            "SELECT stock_id, open, high, low, close, volume, amount "
+    for sid, o, h, lo, c, v, a, chg in conn.execute(
+            "SELECT stock_id, open, high, low, close, volume, amount, chg "
             "FROM price_daily WHERE date=?", (date,)):
         if sid in allow:
-            px[sid] = (o, h, lo, c, v or 0, a or 0)
+            px[sid] = (o, h, lo, c, v or 0, a or 0, chg)
 
     prev_close = {}
     if prev:
@@ -113,9 +128,37 @@ def build_date(conn, date, allow=None, swing_min_amount=SWING_MIN_AMOUNT):
     rows.sort(key=lambda x: -x[1])
     out["amount"] = _write(conn, date, "amount", rows)
 
+    # ---- 漲幅榜／跌幅榜 ----
+    # ★ 用官方的漲跌價差，不用 (收盤 − 前日收盤) 自己算。
+    #   除權息當天價格會跳空，自己算會得到假性大跌，那幾檔會佔滿跌幅榜
+    #   前幾名，而且數字看起來完全正常。官方這個值是對除權息參考價算的。
+    # ★ 前一日收盤用 (收盤 − 漲跌價差) 反推，不從資料庫拿：
+    #   這樣除權息當天也對，而且第一天上線就算得出來。
+    # ★ 先看這一天的 chg 夠不夠。只有單邊市場有的話就不要出榜 ——
+    #   「日期完整」不等於「這張榜需要的欄位完整」，這是第三種半套。
+    have_chg = sum(1 for d in px.values() if d[6] is not None)
+    enough_chg = bool(px) and have_chg >= len(px) * CHG_MIN_COVERAGE
+    ups, downs = [], []
+    for sid, (o, h, lo, c, v, a, chg) in (px.items() if enough_chg else ()):
+        if chg is None or c is None or not a or a < swing_min_amount:
+            continue                       # 沒有官方漲跌 or 流動性不足
+        prev = c - chg
+        if prev <= 0:
+            continue
+        pct = chg / prev * 100.0
+        if pct > 0:
+            ups.append((sid, pct))
+        elif pct < 0:
+            downs.append((sid, pct))
+    ups.sort(key=lambda x: -x[1])
+    # 跌幅榜由跌最多排到跌最少，所以是「由小到大」
+    downs.sort(key=lambda x: x[1])
+    out["change_up"] = _write(conn, date, "change_up", ups)
+    out["change_down"] = _write(conn, date, "change_down", downs)
+
     # ---- 振幅榜 ----
     rows = []
-    for sid, (o, h, lo, c, v, a) in px.items():
+    for sid, (o, h, lo, c, v, a, _chg) in px.items():
         pc = prev_close.get(sid)
         if not pc or pc <= 0:
             continue                       # 新上市首日沒有前收，跳過

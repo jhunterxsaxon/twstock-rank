@@ -49,8 +49,11 @@ from datetime import datetime, timezone
 
 DATA = "data"
 
+# ★ chg（官方漲跌價差）加在**最後面**。
+# app.js 是按索引讀 price_fields 的，加在中間會把既有欄位整排錯位 ——
+# 那種錯不會報錯，只會讓畫面上的數字靜悄悄全部變成隔壁欄的值。
 PRICE_FIELDS = ["stock_id", "open", "high", "low", "close",
-                "volume", "amount", "trades"]
+                "volume", "amount", "trades", "chg"]
 MARGIN_FIELDS = ["stock_id", "mp_balance", "mp_prev", "ss_balance", "ss_prev"]
 CHIP_FIELDS = ["stock_id", "foreign_net", "trust_net", "dealer_net", "total_net"]
 VAL_FIELDS = ["stock_id", "per", "pbr", "yield_pct"]
@@ -132,9 +135,12 @@ def load_into_db(conn, limit_months=None):
         obj = load_month("prices", ym)
         for date, rows in (obj.get("days") or {}).items():
             days.add(date)
+            # ★ 舊的月檔只有 8 欄（沒有 chg）。用 len(r) 判斷，
+            #   不要假設長度 —— repo 裡已經有好幾個月的舊格式檔案。
             db.upsert_price(conn, [
                 (r[0], date, r[1], r[2], r[3], r[4], int(r[5] or 0),
-                 r[6] or 0, int(r[7] or 0), "web") for r in rows])
+                 r[6] or 0, int(r[7] or 0), "web",
+                 r[8] if len(r) > 8 else None) for r in rows])
             for r in (obj.get("margin") or {}).get(date, []):
                 pass
         for date, rows in (obj.get("margin") or {}).items():
@@ -190,9 +196,8 @@ def dump_month_prices(conn, ym):
             "SELECT DISTINCT date FROM price_daily WHERE date LIKE ? "
             "ORDER BY date", (ym + "%",)):
         obj["days"][date] = [
-            [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]
-            for r in conn.execute(
-                "SELECT stock_id,open,high,low,close,volume,amount,trades "
+            list(r) for r in conn.execute(
+                "SELECT stock_id,open,high,low,close,volume,amount,trades,chg "
                 "FROM price_daily WHERE date=? ORDER BY stock_id", (date,))]
         m = [[r[0], r[1], r[2], r[3], r[4]] for r in conn.execute(
             "SELECT stock_id,mp_balance,mp_prev,ss_balance,ss_prev "
@@ -253,8 +258,8 @@ def dump_latest(conn, date):
              r["move"] if r["move"] is not None else None]
             for r in rows]
         marks[board] = [[g["stock_id"], g["prev_rank"]] for g in gone]
-    px = [[r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]] for r in conn.execute(
-        "SELECT stock_id,open,high,low,close,volume,amount,trades "
+    px = [list(r) for r in conn.execute(
+        "SELECT stock_id,open,high,low,close,volume,amount,trades,chg "
         "FROM price_daily WHERE date=? ORDER BY stock_id", (date,))]
     val = [[r[0], r[1], r[2], r[3]] for r in conn.execute(
         "SELECT stock_id,per,pbr,yield_pct FROM valuation_daily WHERE date=?",

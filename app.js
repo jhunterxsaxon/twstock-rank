@@ -41,6 +41,7 @@
 
   var UNIT = {
     volume: '張', amount: '億', swing: '%',
+    change_up: '%', change_down: '%',
     chip_buy: '億', chip_sell: '億'
   };
 
@@ -57,7 +58,8 @@
 
   function boardGlKey(b) {
     return ({ volume: 'board.volume', amount: 'board.amount',
-              swing: 'board.swing' })[b] || 'board.chip';
+              swing: 'board.swing', change_up: 'board.change',
+              change_down: 'board.change' })[b] || 'board.chip';
   }
 
   function renderLegend() {
@@ -736,6 +738,7 @@
       + '<dl class="kv">'
       + '<dt>成交量榜</dt><dd>' + esc(glShort('board.volume')) + '</dd>'
       + '<dt>成交金額榜</dt><dd>' + esc(glShort('board.amount')) + '</dd>'
+      + '<dt>漲幅榜／跌幅榜</dt><dd>' + esc(glShort('board.change')) + '</dd>'
       + '<dt>振幅榜</dt><dd>' + esc(glShort('board.swing')) + '</dd>'
       + '<dt>三大法人榜</dt><dd>' + esc(glShort('board.chip')) + '</dd>'
       + '</dl>'

@@ -112,6 +112,11 @@ def fetch_price():
             "volume": _num0(_pick(r, "tradingshares", required=False)),
             "amount": _num0(_pick(r, "transactionamount", required=False)),
             "trades": _num0(_pick(r, "transactionnumber", required=False)),
+            # ★ 官方漲跌價差。做漲跌幅榜一定要用這個，
+            #   不能用 (收盤 − 前日收盤) 自己算 —— 除權息當天價格會跳空，
+            #   自己算會得到假性大跌，那幾檔會直接佔滿跌幅榜前幾名。
+            #   官方這個數字是對**除權息參考價**算的。
+            "chg": netio.num(_pick(r, "change", required=False)),
         })
     return date, out
 

@@ -25,11 +25,34 @@
 - 證交所的「上市個股日成交資訊」含 ETF 與特別股（1,389 筆中有 245 筆 00 開頭），
   所以一定要過白名單。
 """
+import csv
+import io as _io
+
 from core import netio
 
 BASE = "https://openapi.twse.com.tw/v1"
 
 EP_PRICE = f"{BASE}/exchangeReport/STOCK_DAY_ALL"
+
+# ★★ 上市當日資料走這條，不是 openapi ★★
+#
+# 2026-11-20 實測：
+#     13:45  這個網址 -> 2026-11-19
+#     14:29  這個網址 -> 2026-11-20   ← 當天（收盤後約 1 小時）
+#     14:29  openapi  -> 2026-11-19   ← T+1，連續五天 last-modified 05:20:44~45
+#
+# 兩邊欄位完全一樣，所以是直接替換。
+#
+# ★ 合規依據：這是證交所**自己登記在政府資料開放平臺**的資源
+#   （資料集 11549，授權為政府資料開放授權條款第 1 版）
+#     第 8 條  「但臺灣證券交易所已授權『政府資料開放平臺』提供公眾使用之
+#               本網站資料，不在此限」  -> 可以公開散布
+#     第 6 條  禁止「**非依**證交所同意之方式」下載
+#                                      -> 這是他們公告的取用網址
+#   舊規則「不碰 www.twse.com.tw」對「任意爬網站」是對的，
+#   但不該涵蓋證交所自己登記為開放資料的網址。
+EP_PRICE_OPENDATA = ("https://www.twse.com.tw/exchangeReport/"
+                     "STOCK_DAY_ALL?response=open_data")
 EP_MARGIN = f"{BASE}/exchangeReport/MI_MARGN"
 EP_COMPANY = f"{BASE}/opendata/t187ap03_L"
 EP_INDEX = f"{BASE}/exchangeReport/MI_INDEX"
@@ -72,12 +95,60 @@ def _pick(row, *patterns, required=True):
 
 # ---------------- 日行情 ----------------
 
-def fetch_price():
-    """當日全市場日成交資訊（含 ETF、特別股，未過濾）。
+# 開放資料 CSV 的欄位名 -> 我們的欄位名。
+# ★ 照「欄位名」對應，不是照位置 —— CSV 的欄序和 JSON 不一樣
+#   （CSV 是 日期,代號,名稱,股數,金額,開,高,低,收,漲跌,筆數），
+#   寫死位置的話對方調整欄序就會靜悄悄全錯。
+_CSV_MAP = {
+    "證券代號": "stock_id", "證券名稱": "name",
+    "開盤價": "open", "最高價": "high", "最低價": "low", "收盤價": "close",
+    "成交股數": "volume", "成交金額": "amount", "成交筆數": "trades",
+    "漲跌價差": "chg",
+}
 
-    回傳 (date, rows)，rows 是 dict 清單：
-      stock_id, name, open, high, low, close, volume, amount, trades
-    """
+
+def _parse_price_csv(text):
+    """解析開放資料平臺的 STOCK_DAY_ALL CSV。回傳 (date, rows)。"""
+    rdr = csv.DictReader(_io.StringIO(text))
+    if not rdr.fieldnames:
+        raise netio.FetchError("開放資料 CSV 沒有標題列")
+    missing = [k for k in _CSV_MAP if k not in rdr.fieldnames]
+    if missing:
+        # 欄位名變了就停下來，不要用殘缺的資料繼續 ——
+        # 少一個欄位會讓整欄變 None，而榜單還是算得出來，看起來正常。
+        raise netio.FetchError(
+            f"開放資料 CSV 缺少欄位 {missing}，實際有 {rdr.fieldnames}")
+    date, out = None, []
+    for r in rdr:
+        sid = (r.get("證券代號") or "").strip()
+        if not sid:
+            continue
+        if date is None:
+            date = netio.roc_to_iso((r.get("日期") or "").strip())
+        row = {"stock_id": sid}
+        for src_key, dst in _CSV_MAP.items():
+            if dst in ("stock_id", "name"):
+                continue
+            row[dst] = netio.num(r.get(src_key),
+                                 0 if dst in ("volume", "amount", "trades")
+                                 else None)
+        row["name"] = (r.get("證券名稱") or "").strip()
+        out.append(row)
+    if not out:
+        raise netio.FetchError("開放資料 CSV 沒有資料列")
+    if not date:
+        raise netio.FetchError("開放資料 CSV 無法解析日期")
+    return date, out
+
+
+def fetch_price_opendata():
+    """開放資料平臺的 CSV（**當日**，收盤後約 1 小時）。"""
+    return _parse_price_csv(netio.get_text(EP_PRICE_OPENDATA,
+                                           limiter=_limiter))
+
+
+def fetch_price_openapi():
+    """openapi 的 JSON（**T+1**，隔天清晨 05:20）。保留當備援。"""
     data = netio.get_json(EP_PRICE, limiter=_limiter)
     if not data:
         raise netio.FetchError("STOCK_DAY_ALL 回傳空清單")
@@ -99,8 +170,31 @@ def fetch_price():
             "volume": netio.num(r.get("TradeVolume"), 0),
             "amount": netio.num(r.get("TradeValue"), 0),
             "trades": netio.num(r.get("Transaction"), 0),
+            "chg": netio.num(r.get("Change")),
         })
     return date, out
+
+
+def fetch_price(on_fallback=None):
+    """當日全市場日成交資訊（含 ETF、特別股，未過濾）。
+
+    回傳 (date, rows, source)，source 是 'opendata' 或 'openapi'。
+    rows 是 dict 清單：
+      stock_id, name, open, high, low, close, volume, amount, trades, chg
+
+    ★ 為什麼要把 source 回傳出去
+    備援拿到的是**前一個交易日**的資料，而它看起來完全正常 ——
+    榜單照樣算得出來、網頁照樣顯示。如果不告訴呼叫端走了哪一條，
+    「今天的榜單其實是昨天的」這件事就會無聲無息。
+    """
+    try:
+        date, rows = fetch_price_opendata()
+        return date, rows, "opendata"
+    except (netio.FetchError, netio.StopFetching) as e:
+        if on_fallback:
+            on_fallback(e)
+    date, rows = fetch_price_openapi()
+    return date, rows, "openapi"
 
 
 # ---------------- 融資融券 ----------------

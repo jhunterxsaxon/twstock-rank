@@ -76,18 +76,20 @@ class RateLimiter:
         self._last = time.monotonic()
 
 
-def get_json(url, params=None, headers=None, timeout=90,
-             limiter=None, retries=2, backoff=2.0):
-    """GET 一個 JSON。回傳已解析的物件。
+def _request(url, params=None, headers=None, accept="application/json",
+             timeout=90, limiter=None, retries=2, backoff=2.0):
+    """送出一個 GET，回傳 (raw_bytes, content_type)。
 
+    ★ 重試與錯誤政策只有這一份：
     - 4xx **不重試**（除了 429）：請求本身有問題，重試只會讓對方更想封你
     - 402 / 403 → 丟 StopFetching，呼叫端要整批中止
     - 5xx 與網路錯誤 → 指數退避重試，但有次數上限
-    - 回傳的不是 JSON（例如被 WAF 擋掉而回 HTML）→ 丟 FetchError 並附前 300 字
+
+    get_json() 和 get_text() 都走這裡 —— 政策寫兩份一定會分岔。
     """
     if params:
         url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    h = {"User-Agent": UA, "Accept": "application/json"}
+    h = {"User-Agent": UA, "Accept": accept}
     if headers:
         h.update(headers)
 
@@ -99,8 +101,7 @@ def get_json(url, params=None, headers=None, timeout=90,
         try:
             with urllib.request.urlopen(req, timeout=timeout,
                                         context=_ssl_context()) as r:
-                raw = r.read()
-                ctype = r.headers.get("Content-Type", "")
+                return r.read(), r.headers.get("Content-Type", "")
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -115,18 +116,42 @@ def get_json(url, params=None, headers=None, timeout=90,
             last = FetchError(f"HTTP {e.code} {body[:200]}")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last = FetchError(f"{type(e).__name__}: {e}")
-        else:
-            txt = raw.decode("utf-8", errors="replace")
-            try:
-                return json.loads(txt)
-            except json.JSONDecodeError:
-                # 典型情況：被 WAF 擋掉回了 HTML 錯誤頁。這不是暫時性故障，不重試。
-                raise FetchError(
-                    f"回傳不是 JSON（Content-Type: {ctype}），"
-                    f"前 300 字：{txt[:300]!r}")
         if attempt < retries:
             time.sleep(backoff * (2 ** attempt))
     raise last or FetchError("未知錯誤")
+
+
+def get_text(url, params=None, headers=None, timeout=90,
+             limiter=None, retries=2, backoff=2.0):
+    """GET 一個純文字／CSV。回傳 str。
+
+    用 utf-8-sig 解碼 —— 證交所的開放資料 CSV 帶 BOM，
+    不處理的話第一個欄位名會變成 '\ufeff日期'，比對欄位時就會對不上。
+    """
+    raw, _ = _request(url, params, headers, "text/csv, text/plain, */*",
+                      timeout, limiter, retries, backoff)
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def get_json(url, params=None, headers=None, timeout=90,
+             limiter=None, retries=2, backoff=2.0):
+    """GET 一個 JSON。回傳已解析的物件。
+
+    錯誤政策見 _request()。額外處理：回傳的不是 JSON
+    （例如被 WAF 擋掉而回 HTML）→ 丟 FetchError 並附前 300 字。
+    """
+    if params:
+        url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    raw, ctype = _request(url, None, headers, "application/json",
+                          timeout, limiter, retries, backoff)
+    txt = raw.decode("utf-8", errors="replace")
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        # 典型情況：被 WAF 擋掉回了 HTML 錯誤頁。這不是暫時性故障，不重試。
+        raise FetchError(
+            f"回傳不是 JSON（Content-Type: {ctype}），"
+            f"前 300 字：{txt[:300]!r}")
 
 
 # ---------------- 民國年轉換 ----------------

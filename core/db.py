@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS price_daily (
   volume   INTEGER,        -- 成交股數
   amount   REAL,           -- 成交金額（元）
   trades   INTEGER,        -- 成交筆數
+  chg      REAL,           -- 官方漲跌價差（元）
   src      TEXT,           -- 'twse' | 'tpex' | 'finmind'
   PRIMARY KEY (stock_id, date)
 );
@@ -144,7 +145,9 @@ CREATE TABLE IF NOT EXISTS revenue_month (
 );
 
 -- 本益比／股價淨值比／殖利率（日頻）
--- 上市只能靠 FinMind（證交所的 BWIBBU_ALL 被安全防護擋掉）
+-- ★ 2026-11-16 實測：BWIBBU_ALL 已經不會被擋，兩市都走官方。
+-- （舊註解寫「上市只能靠 FinMind」，那是過時資訊。
+--   「某端點被擋」這類結論會過期，要標日期並定期重測。）
 -- 上櫃有官方端點（免費、可散布）
 CREATE TABLE IF NOT EXISTS valuation_daily (
   stock_id  TEXT NOT NULL,
@@ -235,8 +238,20 @@ def connect(path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn):
+    """★ CREATE TABLE IF NOT EXISTS 不會幫**既有**的表加欄位。
+
+    新欄位一定要用 ALTER TABLE，而且必須能重複執行（每次 connect 都會跑）。
+    漏掉這一步的症狀是「新機器正常、舊資料庫報 no such column」。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(price_daily)")}
+    if "chg" not in cols:
+        conn.execute("ALTER TABLE price_daily ADD COLUMN chg REAL")
 
 
 def backup(path=None):
@@ -260,16 +275,23 @@ def log(conn, source, dataset, ok, rows=0, note=""):
 # ---------------- 寫入 ----------------
 
 def upsert_price(conn, rows):
-    """rows: (stock_id, date, open, high, low, close, volume, amount, trades, src)"""
+    """rows: (stock_id,date,open,high,low,close,volume,amount,trades,src[,chg])
+
+    ★ 容許 10 或 11 欄。已經存在 repo 裡的月檔 JSON 沒有 chg，
+    載回來時只有 10 欄 —— 硬性要求 11 欄會讓歷史資料整個載不進來。
+    """
+    norm = [tuple(r) + (None,) if len(r) == 10 else tuple(r) for r in rows]
     conn.executemany(
         "INSERT INTO price_daily "
-        "(stock_id,date,open,high,low,close,volume,amount,trades,src) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "(stock_id,date,open,high,low,close,volume,amount,trades,src,chg) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(stock_id,date) DO UPDATE SET "
         "open=excluded.open, high=excluded.high, low=excluded.low, "
         "close=excluded.close, volume=excluded.volume, amount=excluded.amount, "
-        "trades=excluded.trades, src=excluded.src", rows)
-    return len(rows)
+        "trades=excluded.trades, src=excluded.src, "
+        # ★ 新值是 NULL 時保留舊值：載入舊月檔不該把今天抓到的 chg 清掉
+        "chg=COALESCE(excluded.chg, price_daily.chg)", norm)
+    return len(norm)
 
 
 def upsert_margin(conn, rows):

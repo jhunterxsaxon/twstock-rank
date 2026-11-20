@@ -33,6 +33,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sqlite3
 import sys
 import traceback
@@ -69,9 +70,24 @@ def open_db():
     return conn
 
 
+SRC_ZH = {"opendata": "開放資料平臺．當日",
+          "openapi": "openapi．T+1（備援）"}
+
 PROBE_LOG = os.path.join("data", "probe_log.csv")
 PROBE_COLS = ("run_at_tpe", "scheduled", "twse_date", "twse_modified_tpe",
-              "tpex_date", "tpex_modified_tpe", "action")
+              "tpex_date", "tpex_modified_tpe",
+              "opendata_twse_date", "opendata_twse_modified_tpe", "action")
+
+# ★ 另一條上市的路：證交所登記在政府資料開放平臺的 CSV（資料集 11549）。
+# openapi 確定是 T+1（每天台北 05:20:44~45 一次批次），這條還沒量過。
+# 如果它當天就更新，「下午看到當天上市資料」就成立 —— 而且完全合規：
+#   第 8 條  「但臺灣證券交易所已授權『政府資料開放平臺』提供公眾使用之
+#             本網站資料，不在此限」-> 可散布
+#   第 6 條  禁止的是「非依證交所同意之方式」-> 這是他們公告的取用網址
+# ★ 所以「不碰 www.twse.com.tw」這條舊規則劃得太廣：它對任意爬網站是對的，
+#   但不該涵蓋證交所自己登記為開放資料的網址。
+EP_OPENDATA_TWSE = ("https://www.twse.com.tw/exchangeReport/"
+                    "STOCK_DAY_ALL?response=open_data")
 
 
 def _gmt_to_tpe(s):
@@ -107,6 +123,34 @@ def probe(url):
     return d, _gmt_to_tpe(lm)
 
 
+def probe_csv(url):
+    """探測一個 CSV 端點，回傳 (資料日期, last-modified 台北)。
+
+    ★ 和 probe() 分開的兩個理由
+    1. 這個端點回傳 CSV 不是 JSON。
+    2. **它沒有 last-modified 標頭**（實測只有 Date），所以標頭那條
+       獨立證據在這裡不存在，只能比對內容日期。
+
+    ★ 日期在第一個「資料列」的第一欄，不是標題列：
+         日期,證券代號,證券名稱,成交股數,成交金額,...
+         "1151119","0050","元大台灣50",...
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": netio.UA, "Accept": "text/csv, */*"})
+    with urllib.request.urlopen(req, timeout=60,
+                                context=netio._ssl_context()) as r:
+        lm = r.headers.get("last-modified", "")
+        text = r.read().decode("utf-8-sig", "replace")
+    date = None
+    for line in text.splitlines()[1:4]:
+        m = re.match(r'^\s*"?(\d{7,8})"?\s*,', line)
+        if m:
+            date = netio.roc_to_iso(m.group(1))
+            if date:
+                break
+    return date, _gmt_to_tpe(lm)
+
+
 def append_probe(row):
     """★ 空跑也要留下痕跡
 
@@ -117,8 +161,23 @@ def append_probe(row):
     這份 CSV 每次執行都會多一行，不管有沒有新資料。有了否定樣本，
     才夾得出官方實際幾點更新。
     """
-    new = not os.path.exists(PROBE_LOG)
     os.makedirs(os.path.dirname(PROBE_LOG), exist_ok=True)
+    # ★ 欄位增加時要先把舊檔案升級。
+    # 這份 CSV 已經在 repo 裡累積了十幾列、表頭是舊的 7 欄。直接追加
+    # 新的 9 欄會和表頭對不齊，而 probe_report.py 用 DictReader 讀 ——
+    # 欄位錯位不會報錯，只會讓分析結果靜悄悄變成垃圾。
+    if os.path.exists(PROBE_LOG):
+        with open(PROBE_LOG, encoding="utf-8", newline="") as f:
+            old_rows = list(csv.reader(f))
+        if old_rows and tuple(old_rows[0]) != PROBE_COLS:
+            head = old_rows[0]
+            kept = [dict(zip(head, r)) for r in old_rows[1:]]
+            with open(PROBE_LOG, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f, lineterminator="\n")
+                w.writerow(PROBE_COLS)
+                for k in kept:
+                    w.writerow([k.get(c, "") for c in PROBE_COLS])
+    new = not os.path.exists(PROBE_LOG)
     with open(PROBE_LOG, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
         if new:
@@ -193,7 +252,16 @@ def main(argv=None):
     except Exception as e:
         tpex_date, tpex_lm = None, ""
         log(f"  （上櫃探測失敗，不影響判斷：{e}）")
+    # ★ 另一條上市的路，只探測不使用 —— 先量出它幾點更新再決定要不要接。
+    try:
+        od_date, od_lm = probe_csv(EP_OPENDATA_TWSE)
+    except Exception as e:
+        od_date, od_lm = None, ""
+        log(f"  （開放資料平臺端點探測失敗，不影響判斷：{e}）")
     log(f"  上市 {latest}　檔案生成於 {twse_lm or '（未提供）'}")
+    log(f"  上市(開放資料平臺) {od_date}"
+        + ("　★ 比 openapi 新，當日資料走這條路拿得到"
+           if od_date and latest and od_date > latest else ""))
     log(f"  上櫃 {tpex_date}　檔案生成於 {tpex_lm or '（未提供）'}")
     # ★ 這裡原本每次都會寫一條「官方資料仍停在 X（今天是 Y）」的註記。
     # 但官方是隔天清晨才發布，latest 永遠不可能等於今天 —— 等於每跑必出，
@@ -212,6 +280,8 @@ def main(argv=None):
         "scheduled": a.scheduled or "手動",
         "twse_date": latest or "", "twse_modified_tpe": twse_lm,
         "tpex_date": tpex_date or "", "tpex_modified_tpe": tpex_lm,
+        "opendata_twse_date": od_date or "",
+        "opendata_twse_modified_tpe": od_lm,
         "action": "skip" if skip else "fetch"})
     if skip:
         log(f"  {latest} 的資料已經有了 → 結束（探測紀錄已留存）")
@@ -235,9 +305,16 @@ def main(argv=None):
 
     # ---- 行情 ----
     log("抓兩市行情…")
-    d1, rows1 = twse.fetch_price()
+    d1, rows1, src1 = twse.fetch_price(
+        on_fallback=lambda e: log(f"  ⚠ 開放資料平臺失敗，退回 openapi：{e}"))
     d2, rows2 = tpex.fetch_price()
-    log(f"  上市 {d1} 原始 {len(rows1)} 筆｜上櫃 {d2} 原始 {len(rows2)} 筆")
+    log(f"  上市 {d1}（{SRC_ZH.get(src1, src1)}）原始 {len(rows1)} 筆"
+        f"｜上櫃 {d2} 原始 {len(rows2)} 筆")
+    if src1 != "opendata":
+        # ★ 備援拿到的是**前一個交易日**的資料，而它看起來完全正常。
+        #   不講出來的話，「今天的榜單其實是昨天的」就無聲無息。
+        notes.append("上市資料來自備援端點（openapi，隔天清晨才更新），"
+                     "不是當日的開放資料平臺")
     if d1 != d2:
         notes.append(f"兩市日期不一致（上市 {d1}／上櫃 {d2}）")
     bench = [("0050", d1, r["close"]) for r in rows1
@@ -251,7 +328,8 @@ def main(argv=None):
         keep = universe.filter_rows(rows, allow)
         n += db.upsert_price(conn, [
             (r["stock_id"], date, r["open"], r["high"], r["low"], r["close"],
-             int(r["volume"] or 0), r["amount"] or 0, int(r["trades"] or 0), src)
+             int(r["volume"] or 0), r["amount"] or 0, int(r["trades"] or 0),
+             src, r.get("chg"))
             for r in keep])
         log(f"  {src} 過白名單後 {len(keep)} 筆")
     log(f"  共寫入 {n} 筆")
@@ -274,7 +352,22 @@ def main(argv=None):
             notes.append(f"{label}抓取失敗：{e}")
 
     # ---- 榜單 ----
-    dates = [d1] if not a.rebuild else db.trading_days(conn)
+    # ★★ 榜單只能算在「兩市都有資料」的日期上 ★★
+    # 上市來源換成開放資料平臺之後，上市當天約 14:00 就有、上櫃要等 16:00，
+    # 所以**每天 14:00~16:00 都會有一個只有上市的半套日期**。
+    # 拿它算榜單會得到只有 1,091 檔的榜 —— 而且數字看起來完全正常。
+    # （2026-11-20 14:52 實測到：所有榜單的市場都只有 twse。）
+    #
+    # ★ --rebuild 也要過濾。這裡的半套日期不是建庫途中的暫時現象，
+    #   而是發布時間差造成的真實資料，回溯重算一樣不能用它。
+    complete = db.complete_days(conn)
+    if not complete:
+        log("✖ 還沒有任何「兩市都有資料」的交易日，無法算榜單")
+        return 1
+    rank_date = complete[-1]
+    if rank_date != d1:
+        log(f"  * 榜單算 {rank_date}（兩市都有），不是 {d1}")
+    dates = [rank_date] if not a.rebuild else complete
     log(f"算榜單（{len(dates)} 天）…")
     for i, d in enumerate(dates, 1):
         ranking.build_date(conn, d, allow=allow)
@@ -290,7 +383,11 @@ def main(argv=None):
     # ---- 匯出 ----
     log("匯出 JSON…")
     ws.dump_universe(conn)
-    touched = sorted({ws.month_of(d) for d in dates} | {ws.month_of(d2)})
+    # ★ d1 的月份也要匯出：今天的上市資料雖然還不能算榜單，
+    #   但它已經寫進 price_daily 了，月檔要跟著更新，
+    #   否則等上櫃補上時會發現上市那半沒存到。
+    touched = sorted({ws.month_of(d) for d in dates}
+                     | {ws.month_of(d1), ws.month_of(d2)})
     for ym in touched:
         ws.dump_month_prices(conn, ym)
         ws.dump_month_boards(conn, ym)
@@ -300,7 +397,7 @@ def main(argv=None):
             ws.dump_month_prices(conn, ym)
             ws.dump_month_boards(conn, ym)
     ws.dump_benchmark(conn)
-    ws.dump_latest(conn, d1)
+    ws.dump_latest(conn, rank_date)
     ws.dump_fundamental(conn)
     log("算技術指標…")
     ws.dump_technical(conn, progress=log)
@@ -308,18 +405,23 @@ def main(argv=None):
 
     part2 = db.partial_days(conn)
     if part2:
+        # ★ 2026-11-20 起方向反過來了：上市比較快。
+        #   上市走開放資料平臺，當天約 14:00 就有；上櫃要等 16:00。
+        #   所以每天 14:00~16:00 之間會看到「只有上市」的半套日期。
         notes.append(
             "；".join(f"{d} 目前只有{'上市' if m == 'twse' else '上櫃'}的資料"
                       for d, m in part2)
-            + " —— 櫃買台北 16:00 就發布當日收盤，證交所要等隔天清晨，"
-              "所以傍晚到清晨之間會有半天的落差。等證交所補上就會自動完整。")
-    miss = missing_days(conn, d1)
+            + " —— 上市當天約 14:00 就發布、上櫃要等 16:00，"
+              "所以下午那兩個小時會有半邊的落差。等另一邊補上就會自動完整，"
+              "榜單在那之前仍以前一個完整交易日為準。")
+    miss = missing_days(conn, rank_date)
     if miss:
         log(f"⚠ 疑似漏掉 {len(miss)} 個交易日：{'、'.join(miss)}")
         notes.append(
             f"疑似漏掉 {len(miss)} 個交易日（{'、'.join(miss)}）—— "
             f"官方 API 不支援查詢過去的日期，這些日子補不回來")
-    ws.dump_meta(conn, d1, scheduled=a.scheduled, notes=notes, missing=miss)
+    ws.dump_meta(conn, rank_date, scheduled=a.scheduled, notes=notes,
+                 missing=miss)
     ws.history_index()
 
     total = 0
