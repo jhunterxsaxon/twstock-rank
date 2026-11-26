@@ -51,7 +51,12 @@
           <th data-sort="rank">排名</th>
           <th data-sort="code">代號</th>
           <th data-sort="name">名稱</th>
-          <th data-sort="metric" class="num">指標值</th>
+          <th data-sort="close" class="num" data-gl="px.close">收盤價</th>
+          <!-- ★ 這一欄的文字由 app.js 隨榜替換（成交量(張)、漲幅(%)…）。
+               原本寫死「指標值」—— 對七張榜都成立，但對每一張都沒說清楚
+               它到底是股數、金額還是百分比。data-gl 也跟著換。 -->
+          <th data-sort="metric" class="num" id="th-metric"
+              data-gl="px.metric">排名依據</th>
           <th data-sort="streak" class="num" data-gl="rank.streak">連續在榜</th>
           <th data-gl="rank.new">標記</th>
           <th data-sort="move" class="num" data-gl="rank.move">排名變化</th>

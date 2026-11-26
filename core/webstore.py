@@ -388,6 +388,12 @@ def dump_meta(conn, date, scheduled=None, started=None, notes=None,
         "top_n": ranking.TOP_N,
         "boards": ranking.BOARDS,
         "board_zh": ranking.BOARD_ZH,
+        # ★ 「指標值」每張榜是不同的東西，所以表頭要隨榜改名。
+        #   名字只在 ranking.METRIC_ZH 寫一次，從這裡帶給網頁 ——
+        #   本機 GUI、CSV 匯出、網頁三邊讀同一份，不會分岔。
+        #   格式：{board: [欄名, 單位]}，例如 volume -> ["成交量", "張"]。
+        "metric_zh": {b: list(v) for b, v in ranking.METRIC_ZH.items()},
+        "board_gl": ranking.BOARD_GLOSSARY,
         "sources": SOURCE_CREDIT,
         "license": LICENSE_NOTE,
         "notes": notes or [],

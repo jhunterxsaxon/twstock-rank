@@ -39,11 +39,68 @@
     return v.toLocaleString('en-US');
   }
 
-  var UNIT = {
-    volume: '張', amount: '億', swing: '%',
-    change_up: '%', change_down: '%',
-    chip_buy: '億', chip_sell: '億'
+  /* ★★ 「指標值」每張榜是不同的東西 ★★
+
+     rank_daily.metric 是該榜的排序值，但成交量榜是股數、金額榜是金額、
+     漲幅榜是漲跌幅、振幅榜是振幅、法人榜是買賣超金額。
+     以前表頭就寫「指標值」—— 對七張榜都成立，對每一張都沒說清楚。
+
+     ★ 名字的來源是 meta.json 的 metric_zh，而 meta.json 是
+       core/ranking.py 的 METRIC_ZH 倒出來的 —— 本機 GUI、CSV 匯出、
+       這個網頁三邊讀同一份，不會分岔。
+
+     ★ 下面這份是**後備**，只在 meta.json 還是舊版（Actions 還沒重跑過）
+       時用得到。不是第二份真相 —— 一旦 Actions 跑過就不會再讀它。
+       刻意保留是因為：沒有後備的話，使用者會在改版後的那幾個小時
+       看到一欄空白的表頭，那比舊名字糟得多。 */
+  var METRIC_FALLBACK = {
+    volume: ['成交量', '張'], amount: ['成交金額', '億'],
+    change_up: ['漲幅', '%'], change_down: ['跌幅', '%'],
+    swing: ['振幅', '%'],
+    chip_buy: ['買超金額', '億'], chip_sell: ['賣超金額', '億']
   };
+
+  function metricPair(b) {
+    var m = (S.meta && S.meta.metric_zh) || {};
+    return m[b] || METRIC_FALLBACK[b] || ['指標值', ''];
+  }
+
+  function metricLabel(b) {
+    var p = metricPair(b);
+    return p[1] ? p[0] + '(' + p[1] + ')' : p[0];
+  }
+
+  function metricUnit(b) { return metricPair(b)[1] || ''; }
+
+  /* ★ 千分位在 CSV 裡是壞的：成交量榜的 money() 會產生 "357,749"，
+       不加引號寫進 CSV 就被拆成兩欄，整列往右錯位一格。
+       這是既有的錯（2026-11-26 發現並修掉）。
+       拿掉千分位而不是加引號 —— Excel 會自己加千分位顯示，
+       但引號裡的數字它當文字，就不能加總了。 */
+  function csvNum(s) { return String(s).replace(/,/g, ''); }
+
+  /* 收盤價查表：latest.json 本來就夾帶全市場的 open/high/low/close，
+     但以前完全沒用到 —— 所以多這一欄是 0 KB 成本，首次載入量不變
+     （那是這個網站少數幾個一旦變大就回不去的指標）。
+     ★ 快取在 S.px，不要每次 render 都重建 1,987 筆的表。 */
+  function closeMap() {
+    if (S.px) return S.px;
+    var m = {}, f = (S.latest && S.latest.price_fields) || [];
+    var ci = f.indexOf('close'), si = f.indexOf('stock_id');
+    if (ci >= 0 && si >= 0) {
+      ((S.latest && S.latest.prices) || []).forEach(function (r) {
+        m[r[si]] = r[ci];
+      });
+    }
+    S.px = m;
+    return m;
+  }
+
+  /* ★ 照欄位名取值，不要照位置 —— price_fields 以後加欄位就不會錯位。 */
+  function closeOf(sid) {
+    var v = closeMap()[sid];
+    return (v === null || v === undefined) ? '' : v.toFixed(2);
+  }
 
   function esc(s) {
     return String(s === null || s === undefined ? '' : s)
@@ -56,10 +113,19 @@
   function glShort(key) { return (S.gl[key] || {}).short || ''; }
   function glLabel(key) { return (S.gl[key] || {}).label || key; }
 
+  /* ★ 原本漏列 chip_buy / chip_sell，靠 || 'board.chip' 接住 ——
+       會動，但新增一張榜時也會被靜靜接到「三大法人榜」的說明去
+       （本機版的 CSV 匯出就真的出過這個錯：漲幅榜印成法人榜的說明）。
+       改成以 meta.json 的 board_gl 為主，後備才用寫死的表。 */
+  var GL_FALLBACK = {
+    volume: 'board.volume', amount: 'board.amount', swing: 'board.swing',
+    change_up: 'board.change', change_down: 'board.change',
+    chip_buy: 'board.chip', chip_sell: 'board.chip'
+  };
+
   function boardGlKey(b) {
-    return ({ volume: 'board.volume', amount: 'board.amount',
-              swing: 'board.swing', change_up: 'board.change',
-              change_down: 'board.change' })[b] || 'board.chip';
+    return ((S.meta && S.meta.board_gl) || {})[b]
+      || GL_FALLBACK[b] || 'board.volume';
   }
 
   function renderLegend() {
@@ -212,10 +278,19 @@
 
   function renderBoard() {
     if (!S.latest) return;
-    var unit = UNIT[S.board] || '';
+    var unit = metricUnit(S.board);
     var rows = S.rows.length ? S.rows : boardRows();
     var nm = names();
 
+    /* ★ 表頭隨榜改名。切分頁時要跟著換，不是只在載入時設一次。 */
+    var th = $('#th-metric');
+    if (th) {
+      th.textContent = metricLabel(S.board);
+      /* hover 表頭看到的是**這張榜**的說明，不是通用的「排名依據」 */
+      th.dataset.gl = boardGlKey(S.board);
+    }
+
+    var px = closeMap();
     var sorted = rows.slice();
     var k = S.sortKey, desc = S.sortDesc;
     var idx = { rank: 1, metric: 2, streak: 3, move: 6 }[k];
@@ -223,6 +298,8 @@
       var x, y;
       if (k === 'code') { x = a[0]; y = b[0]; }
       else if (k === 'name') { x = nm[a[0]] || ''; y = nm[b[0]] || ''; }
+      /* ★ 收盤價不在榜單列裡，要從 price_fields 查 —— 不能用 idx */
+      else if (k === 'close') { x = px[a[0]]; y = px[b[0]]; }
       else { x = a[idx]; y = b[idx]; }
       if (x === null || x === undefined) return 1;
       if (y === null || y === undefined) return -1;
@@ -245,6 +322,7 @@
         + '<td class="num">' + r[1] + '</td>'
         + '<td class="code">' + esc(r[0]) + '</td>'
         + '<td>' + esc(nm[r[0]] || '') + '</td>'
+        + '<td class="num">' + closeOf(r[0]) + '</td>'
         + '<td class="num">' + money(r[2], unit) + '</td>'
         + '<td class="num">' + r[3] + '</td>'
         + '<td class="' + cls + '">' + mark + '</td>'
@@ -809,13 +887,17 @@
   }
 
   function downloadCsv() {
-    var nm = names(), unit = UNIT[S.board] || '';
-    var lines = ['排名,代號,名稱,指標值,連續在榜,標記,排名變化'];
+    var nm = names(), unit = metricUnit(S.board);
+    /* ★ 表頭要和畫面一致：第 5 欄寫這張榜真正的排名依據，
+         不是籠統的「指標值」。另外多一欄收盤價。 */
+    var lines = ['# 收盤價是 ' + (S.latest.date || '') + ' 的收盤，不是現價',
+                 ['排名', '代號', '名稱', '收盤價', metricLabel(S.board),
+                  '連續在榜', '標記', '排名變化'].join(',')];
     currentRows().forEach(function (r) {
       var mark = r[5] ? '回榜' : (r[4] ? '新進榜' : '連續 ' + r[3] + ' 天');
       /* 代號用 ="0050" 的文字格式，否則 Excel 會把前面的 0 吃掉 */
       lines.push([r[1], '="' + r[0] + '"', nm[r[0]] || '',
-                  money(r[2], unit), r[3], mark,
+                  closeOf(r[0]), csvNum(money(r[2], unit)), r[3], mark,
                   (r[6] === null || r[6] === undefined) ? '' : r[6]].join(','));
     });
     var zh = (S.meta.board_zh || {})[S.board] || S.board;

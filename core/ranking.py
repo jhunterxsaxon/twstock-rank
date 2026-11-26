@@ -77,6 +77,55 @@ BOARD_ZH = {
     "chip_sell": "三大法人賣超榜",
 }
 
+# ★★ 「指標值」到底是什麼 —— 單一來源 ★★
+#
+# rank_daily.metric 是該榜的排序值，但**每張榜是不同的東西**。
+# 以前表頭就寫「指標值」：對七張榜都成立，可是對每一張都沒說清楚。
+#
+# ★ 為什麼放在這裡而不是 UI
+# 同一件事原本列舉在三個地方 —— ui/rank_page.py 的 UNIT、
+# core/export.py 的 _fmt_metric、網頁 app.js 的 UNIT。
+# 三份各自列舉七張榜，新增榜單時漏掉任何一份都**不會報錯**，
+# 只會讓那一欄顯示成未換算的原始值。
+# 現在三邊都讀這一份（網頁透過 meta.json 的 metric_zh）。
+#
+# 格式：board -> (欄名, 單位)。單位要讓 money() 認得（張／億／%／元）。
+METRIC_ZH = {
+    "volume": ("成交量", "張"),
+    "amount": ("成交金額", "億"),
+    "change_up": ("漲幅", "%"),
+    "change_down": ("跌幅", "%"),
+    "swing": ("振幅", "%"),
+    "chip_buy": ("買超金額", "億"),
+    "chip_sell": ("賣超金額", "億"),
+}
+
+#: 每張榜對應的名詞說明 key。
+#  ★ 以前 export.py 用 dict.get(board, "board.chip") 取這個值，
+#    於是漲幅榜／跌幅榜的 CSV 標頭寫成「三大法人榜」的說明 ——
+#    漏接的 default 把兩張榜靜靜接到錯的地方。列全就不會有 default。
+BOARD_GLOSSARY = {
+    "volume": "board.volume",
+    "amount": "board.amount",
+    "change_up": "board.change",
+    "change_down": "board.change",
+    "swing": "board.swing",
+    "chip_buy": "board.chip",
+    "chip_sell": "board.chip",
+}
+
+
+def metric_label(board):
+    """表頭文字，例如「成交量(張)」、「漲幅(%)」。"""
+    name, unit = METRIC_ZH.get(board, ("指標值", ""))
+    return f"{name}({unit})" if unit else name
+
+
+def metric_unit(board):
+    """該榜指標值的單位，給 money() 用。"""
+    return METRIC_ZH.get(board, ("", ""))[1]
+
+
 # 振幅榜的流動性門檻：成交金額至少 1,000 萬元
 SWING_MIN_AMOUNT = 10_000_000
 
@@ -247,6 +296,7 @@ def marked(conn, board, date, top_n=None, market="all"):
 
     回傳 dict 清單，每筆含：
       stock_id, name, rank, metric,
+      close     該交易日的收盤價（★ 不是現價；停牌或缺漏為 None）
       streak    連續在榜天數（含今天）
       is_new    今天第一次進榜（前一交易日不在）
       is_back   新進榜且歷史上曾經在過
@@ -274,6 +324,11 @@ def marked(conn, board, date, top_n=None, market="all"):
     metrics = dict(conn.execute(
         "SELECT stock_id, metric FROM rank_daily WHERE board=? AND date=? "
         "AND market=? AND rank <= ?", (board, date, market, n)))
+    # ★ 收盤價在這裡一起撈，不要讓每個呼叫端自己查 ——
+    #   介面、CSV 匯出、網頁三邊各查一次就會有三種「缺漏時怎麼辦」。
+    #   一個 query 撈全市場，成本可以忽略。
+    closes = dict(conn.execute(
+        "SELECT stock_id, close FROM price_daily WHERE date=?", (date,)))
     prev_day = days[i - 1] if i > 0 else None
     prev = dict(conn.execute(
         "SELECT stock_id, rank FROM rank_daily WHERE board=? AND date=? "
@@ -314,6 +369,7 @@ def marked(conn, board, date, top_n=None, market="all"):
             "name": names.get(sid, ""),
             "rank": rk,
             "metric": metrics.get(sid),
+            "close": closes.get(sid),
             "streak": streak,
             "is_new": is_new,
             "is_back": is_back,
