@@ -185,6 +185,104 @@ def append_probe(row):
         w.writerow([row.get(c, "") for c in PROBE_COLS])
 
 
+def valuation_gaps(conn):
+    """找出估值不完整的交易日。回傳 [(date, ['twse', ...]), ...]。
+
+    ★ 分母用「同一天該市場有價量的檔數」，不是寫死 1088/894。
+    檔數會變（上市上櫃、新上市、下市），寫死的話某天多一檔就誤判成缺。
+
+    ★ 門檻用一半，不是「等於 0」。
+    抓到一半失敗（例如寫了 300 筆就斷線）也要補 ——
+    那種情況比完全沒有更難發現，因為頁面上看起來有資料。
+    """
+    out = []
+    for d, in conn.execute(
+            "SELECT DISTINCT date FROM price_daily ORDER BY date"):
+        need = []
+        for mk in ("twse", "tpex"):
+            px = conn.execute(
+                "SELECT COUNT(*) FROM price_daily p JOIN stock s"
+                " ON s.stock_id=p.stock_id WHERE p.date=? AND s.market=?",
+                (d, mk)).fetchone()[0]
+            vl = conn.execute(
+                "SELECT COUNT(*) FROM valuation_daily v JOIN stock s"
+                " ON s.stock_id=v.stock_id WHERE v.date=? AND s.market=?",
+                (d, mk)).fetchone()[0]
+            if px and vl < px * 0.5:
+                need.append(mk)
+        if need:
+            out.append((d, need))
+    return out
+
+
+def backfill_valuations(conn, only=None):
+    """補估值。only 給 'YYYY-MM-DD' 就只補那天（兩市都抓）。
+
+    ★ 為什麼這支存在
+    兩市的估值發布時間差兩小時，排程落在哪個時段決定當天抓到哪一半。
+    以前漏掉就永久消失（openapi 不吃 date），現在補得回來。
+
+    ★ 失敗不中止其他天
+    一天抓失敗就記下來繼續 —— 補 10 天時因為第 3 天假日而整批停掉，
+    代價比多印幾行錯誤大得多。
+    """
+    ZH = {"twse": "上市", "tpex": "上櫃"}
+    allow = db.whitelist(conn)
+    if not allow:
+        log("✖ 白名單是空的，無法過濾")
+        return 1
+
+    if only:
+        todo = [(only, ["twse", "tpex"])]
+        log(f"指定補 {only}（兩市都抓）")
+    else:
+        todo = valuation_gaps(conn)
+        if not todo:
+            log("估值沒有缺口，不用補")
+            return 0
+        log(f"估值有 {len(todo)} 天不完整：")
+        for d, mks in todo:
+            log(f"  {d}  缺 {'、'.join(ZH[m] for m in mks)}")
+
+    fns = {"twse": twse.fetch_valuation, "tpex": tpex.fetch_valuation}
+    done, failed, months = 0, [], set()
+    for d, mks in todo:
+        for mk in mks:
+            try:
+                got, rows = fns[mk](d)
+            except Exception as e:
+                failed.append(f"{d} {ZH[mk]}（{e}）")
+                log(f"  ✖ {d} {ZH[mk]}：{e}")
+                continue
+            rows = [r for r in rows if r[0] in allow]
+            n = db.upsert_valuation(conn, rows)
+            done += n
+            months.add(ws.month_of(d))
+            log(f"  ✔ {d} {ZH[mk]}　{n} 筆（對方回報 {got}）")
+    conn.commit()
+
+    if not months:
+        log("✖ 一天都沒補到")
+        return 1
+
+    # ★ 估值出現在三個檔，少寫一個就是「補了但頁面沒變」：
+    #     月檔            歷史估值（本機版 sync_from_web 讀這個）
+    #     fundamental.json  基本面頁顯示的那份（最新交易日）
+    #     latest.json       首頁快照裡的 valuations
+    log("匯出 JSON…")
+    for ym in sorted(months):
+        ws.dump_month_prices(conn, ym)
+        log(f"  {ym}")
+    ws.dump_fundamental(conn)
+    complete = db.complete_days(conn)
+    if complete:
+        ws.dump_latest(conn, complete[-1])
+        log(f"  latest.json（{complete[-1]}）")
+    log(f"完成。寫入 {done:,} 筆估值"
+        + (f"；{len(failed)} 項失敗：{'；'.join(failed)}" if failed else ""))
+    return 0
+
+
 def missing_days(conn, latest):
     """找出「照理說該有、但我們沒有」的交易日。
 
@@ -223,6 +321,10 @@ def main(argv=None):
                     help="重算所有歷史榜單")
     ap.add_argument("--scheduled", default=os.environ.get("SCHEDULED_AT", ""),
                     help="排程設定的時間（給延遲統計用）")
+    ap.add_argument("--backfill-valuation", nargs="?", const="auto",
+                    default=None, metavar="YYYY-MM-DD",
+                    help="補估值不完整的交易日（兩市的估值都吃日期）。"
+                         "給日期只補那天，不給就自動找出缺口")
     a = ap.parse_args(argv)
 
     notes = []
@@ -239,6 +341,16 @@ def main(argv=None):
     if part:
         log("  ⚠ 只有單一市場的日期："
             + "、".join(f"{d}（只有{m}）" for d, m in part))
+
+    # ★ 回補要在探測之前分支出去。
+    #   探測底下有「兩市都沒有新資料 -> 結束」的提早返回，
+    #   而回補正是要在沒有新資料的時候也能跑。
+    if a.backfill_valuation:
+        rc = backfill_valuations(
+            conn,
+            None if a.backfill_valuation == "auto" else a.backfill_valuation)
+        conn.close()
+        return rc
 
     log("查官方最新交易日…")
     try:

@@ -36,6 +36,9 @@
 包含權證、債券 ETF 等等，而上櫃「公司」只有 897 檔。
 不過白名單一定要用，差了 15 倍。
 """
+import csv
+import io as _io
+
 from core import netio
 
 BASE = "https://www.tpex.org.tw/openapi/v1"
@@ -45,6 +48,24 @@ EP_MARGIN = f"{BASE}/tpex_mainboard_margin_balance"
 EP_CHIP = f"{BASE}/tpex_3insti_daily_trading"
 EP_COMPANY = f"{BASE}/mopsfin_t187ap03_O"
 EP_VALUATION = f"{BASE}/tpex_mainboard_peratio_analysis"
+
+# ★★ 估值走這條，不是 openapi ★★
+#
+# 2026-11-27 查 data.gov.tw 資料集 11373 得到：
+#     名稱  上櫃股票個股本益比、殖利率、股價淨值比（櫃買中心）
+#     授權  1（政府資料開放授權條款第 1 版）
+#
+# ★ 和上市那條（資料集 11764）一樣**吃日期**，格式是民國帶斜線：
+#       &d=115/11/24
+#   2026-11-27 實測：
+#       不帶日期      -> 1151126，895 檔
+#       d=115/11/24   -> 1151124，894 檔
+#
+# 欄位：資料日期、股票代號、名稱、本益比、每股股利、殖利率、股價淨值比
+# ★ 注意欄名是「殖利率」，上市那邊是「殖利率(%)」—— 兩邊不一樣，
+#   所以兩個解析函式不能共用一份欄位對應表。
+EP_PER_OPENDATA = ("https://www.tpex.org.tw/web/stock/aftertrading/"
+                   "peratio_analysis/pera_result.php?l=zh-tw&o=data")
 EP_DIVIDEND = f"{BASE}/tpex_exright_daily"
 
 SOURCE_CREDIT = "證券櫃檯買賣中心"
@@ -240,23 +261,56 @@ def fetch_dividends():
     return out
 
 
-def fetch_valuation():
-    """當日全市場上櫃的本益比、殖利率、股價淨值比。回傳 (date, rows)。
+_PER_CSV_MAP = {"本益比": "per", "股價淨值比": "pbr", "殖利率": "yield_pct"}
 
-    ★ 這是**官方、免費、可散布**的來源（政府資料開放授權條款），
-    所以之後的網頁版可以用它。
 
-    ★ 2026-11-16 更新：證交所的 `BWIBBU_ALL`（上市版）**已經可以正常存取**，
-    回 1,086 筆。2026-11-10 當時它回 HTML「因為安全性考量…」，
-    所以專案一度記載「上市本益比只能靠 FinMind」—— **那個結論已經過時**，
-    兩市現在都有官方、可散布的本益比。見 twse.fetch_valuation()。
+def _roc_slash(day):
+    """'2026-11-24' -> '115/11/24'（櫃買的日期參數格式）。"""
+    y, m, d = str(day).split("-")
+    return f"{int(y) - 1911}/{m}/{d}"
+
+
+def _parse_per_csv(text):
+    """解析資料集 11373 的 pera_result CSV。回傳 (date, rows)。
+
+    rows 是 db.upsert_valuation() 要的 tuple：
+        (stock_id, date, per, pbr, yield_pct, src)
+    """
+    rdr = csv.DictReader(_io.StringIO(text))
+    if not rdr.fieldnames:
+        raise netio.FetchError("上櫃估值 CSV 沒有標題列")
+    missing = [k for k in _PER_CSV_MAP if k not in rdr.fieldnames]
+    if missing:
+        raise netio.FetchError(
+            f"上櫃估值 CSV 缺少欄位 {missing}，實際有 {rdr.fieldnames}")
+    date, out = None, []
+    for r in rdr:
+        sid = (r.get("股票代號") or "").strip()
+        if not sid:
+            continue
+        if date is None:
+            date = netio.roc_to_iso((r.get("資料日期") or "").strip())
+        out.append((sid, date,
+                    netio.num(r.get("本益比")),
+                    netio.num(r.get("股價淨值比")),
+                    netio.num(r.get("殖利率")),
+                    "tpex"))
+    if not out:
+        raise netio.FetchError("上櫃估值 CSV 沒有資料列")
+    if not date:
+        raise netio.FetchError("上櫃估值 CSV 無法解析日期")
+    return date, out
+
+
+def fetch_valuation_openapi():
+    """openapi 的 peratio_analysis（**只有最新一天**）。留作備援。
 
     欄位（實測 894 筆）：
       PriceEarningRatio、DividendPerShare、YieldRatio、PriceBookRatio
     """
     data = netio.get_json(EP_VALUATION, limiter=_limiter)
     if not data:
-        return None, []
+        raise netio.FetchError("peratio_analysis 回傳空清單")
     date = netio.roc_to_iso(data[0].get("Date"))
     out = []
     for r in data:
@@ -270,3 +324,30 @@ def fetch_valuation():
             netio.num(_pick(r, "yieldratio", required=False)),
             "tpex"))
     return date, out
+
+
+def fetch_valuation(day=None):
+    """上櫃的本益比、殖利率、股價淨值比。回傳 (date, rows)。
+
+    day=None -> 最新一個交易日；day="YYYY-MM-DD" -> 那天（可回補）。
+
+    ★ 2026-11-27 起兩市都能依日期回補，所以專案裡「漏掉就永久消失」
+    那個結論對估值已經不成立（對價量的 openapi 仍然成立）。
+
+    ★ 指定日期時沒有備援 —— 備援只給最新一天，拿它充當指定日期的資料
+    會寫進一份日期錯誤的估值，而且看起來完全正常。
+    """
+    url = EP_PER_OPENDATA
+    if day:
+        url += "&d=" + _roc_slash(day)
+    try:
+        date, rows = _parse_per_csv(netio.get_text(url, limiter=_limiter))
+    except (netio.FetchError, netio.StopFetching):
+        if day:
+            raise
+        return fetch_valuation_openapi()
+    if day and date != str(day):
+        raise netio.FetchError(
+            f"要 {day} 的上櫃估值，對方回的是 {date} —— 日期參數可能被忽略了")
+    return date, rows
+

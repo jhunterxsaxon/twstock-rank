@@ -58,6 +58,30 @@ EP_COMPANY = f"{BASE}/opendata/t187ap03_L"
 EP_INDEX = f"{BASE}/exchangeReport/MI_INDEX"
 EP_HOLIDAY = f"{BASE}/holidaySchedule/holidaySchedule"
 EP_PER = f"{BASE}/exchangeReport/BWIBBU_ALL"      # 本益比／殖利率／股價淨值比
+
+# ★★ 估值走這條，不是 openapi ★★
+#
+# 2026-11-27 查 data.gov.tw 資料集 11764 得到（★ 搜尋 API 要 Key，
+# 但單筆查詢 /api/v2/rest/dataset/{id} 不用 —— 之前以為整個平臺都要）：
+#     名稱  盤後資訊 > 個股日本益比、殖利率及股價淨值比（依日期查詢）
+#     授權  1（政府資料開放授權條款第 1 版）、每日更新
+#
+# 和 EP_PRICE_OPENDATA（資料集 11549）**同一個合規基礎** ——
+# 證交所自己登記在政府資料開放平臺的網址，不是猜出來的。
+#
+# ★★ 關鍵差異：這條吃 `&date=YYYYMMDD` ★★
+# 2026-11-27 08:18 實測：
+#     不帶日期       -> 20261126，1,088 檔（當日發布；當時今天的還沒出）
+#     date=20261123  -> 20261123，1,088 檔
+#
+# 所以漏掉的那天**補得回來**。這推翻了本專案先前寫在好幾處的結論
+# 「官方只能每日累積，漏掉就永久消失」—— 那對 openapi 仍然成立，
+# 對這條不成立。（價量能不能也這樣補，還沒查，是另一件事。）
+#
+# 欄位比 openapi 多三個：收盤價、股利年度、財報年/季。我們只取三個值，
+# 其餘不存 —— 收盤價自己已經有一份，用別人的對不起來時很難查。
+EP_PER_OPENDATA = ("https://www.twse.com.tw/rwd/zh/afterTrading/"
+                   "BWIBBU_d?response=open_data")
 EP_EPS = f"{BASE}/opendata/t187ap14_L"            # 各年度 EPS 統計
 EP_DIVIDEND = f"{BASE}/exchangeReport/TWT48U_ALL"  # 除權息預告表
 EP_REVENUE = f"{BASE}/opendata/t187ap05_L"        # 每月營業收入彙總表
@@ -305,23 +329,60 @@ def fetch_indices():
 
 # ---------------- 休市日曆 ----------------
 
-def fetch_valuation():
-    """當日全市場上市的本益比、殖利率、股價淨值比。回傳 (date, rows)。
+# 估值 CSV 的欄位對應。**依欄位名**解析，不靠位置 ——
+# 對方調整欄序時，寫死位置會靜悄悄地全錯（本益比變成殖利率那種）。
+_PER_CSV_MAP = {"本益比": "per", "股價淨值比": "pbr", "殖利率(%)": "yield_pct"}
 
-    ★ 和 tpex.fetch_valuation() 回傳同樣的形狀，呼叫端不必分兩套。
 
-    欄位（實測 1,086 筆）：Date、Code、Name、PEratio、DividendYield、PBratio。
-    `BWIBBU_d` 還多給 ClosePrice 與 FiscalYearQuarter，但那兩個我們不需要
-    （收盤價自己有，而且用別人的收盤價和自己的對不起來時很難查）。
+def _parse_per_csv(text):
+    """解析資料集 11764 的 BWIBBU_d CSV。回傳 (date, rows)。
 
-    ★ 本益比可能是空字串或 "-"（虧損的公司沒有本益比），
-    netio.num() 會回 None，不要硬塞 0 —— 本益比 0 和「沒有本益比」
-    在排序和篩選上是完全不同的意思。
+    rows 是 db.upsert_valuation() 要的 tuple：
+        (stock_id, date, per, pbr, yield_pct, src)
+
+    ★ 本益比、殖利率可能是空字串（虧損或不配息的公司）。
+    netio.num() 會回 None，**不要塞 0** —— 本益比 0 和「沒有本益比」
+    在排序與篩選上是完全不同的意思。
+    """
+    rdr = csv.DictReader(_io.StringIO(text))
+    if not rdr.fieldnames:
+        raise netio.FetchError("估值 CSV 沒有標題列")
+    missing = [k for k in _PER_CSV_MAP if k not in rdr.fieldnames]
+    if missing:
+        # 欄位名變了就停下來。少一欄會讓整欄變 None，而頁面照樣顯示，
+        # 看起來像「這些公司沒有本益比」。
+        raise netio.FetchError(
+            f"估值 CSV 缺少欄位 {missing}，實際有 {rdr.fieldnames}")
+    date, out = None, []
+    for r in rdr:
+        sid = (r.get("證券代號") or "").strip()
+        if not sid:
+            continue
+        if date is None:
+            date = netio.roc_to_iso((r.get("日期") or "").strip())
+        out.append((sid, date,
+                    netio.num(r.get("本益比")),
+                    netio.num(r.get("股價淨值比")),
+                    netio.num(r.get("殖利率(%)")),
+                    "twse"))
+    if not out:
+        raise netio.FetchError("估值 CSV 沒有資料列")
+    if not date:
+        raise netio.FetchError("估值 CSV 無法解析日期")
+    return date, out
+
+
+def fetch_valuation_openapi():
+    """openapi 的 BWIBBU_ALL（**只有最新一天**，不吃 date）。留作備援。
+
+    欄位（實測 1,088 筆）：Date、Code、Name、PEratio、DividendYield、PBratio。
     """
     data = netio.get_json(EP_PER, limiter=_limiter)
     if not data:
-        return None, []
+        raise netio.FetchError("BWIBBU_ALL 回傳空清單")
     date = netio.roc_to_iso(data[0].get("Date"))
+    if not date:
+        raise netio.FetchError(f"無法解析日期：{data[0].get('Date')!r}")
     out = []
     for r in data:
         sid = str(r.get("Code") or "").strip()
@@ -334,6 +395,34 @@ def fetch_valuation():
                     "twse"))
     return date, out
 
+
+def fetch_valuation(day=None):
+    """上市的本益比、殖利率、股價淨值比。回傳 (date, rows)。
+
+    day=None  -> 最新一個交易日
+    day="YYYY-MM-DD" -> 指定那天（**這就是回補的能力**）
+
+    ★ 和 tpex.fetch_valuation() 回傳同樣的形狀，呼叫端不必分兩套。
+
+    ★ 指定日期時**沒有備援**，失敗就讓它拋出來。
+    備援（openapi）只給最新一天 —— 拿它去充當「11-23 的資料」
+    會寫進一份日期錯誤的估值，而且看起來完全正常。寧可失敗。
+    """
+    url = EP_PER_OPENDATA
+    if day:
+        url += "&date=" + str(day).replace("-", "")
+    try:
+        date, rows = _parse_per_csv(netio.get_text(url, limiter=_limiter))
+    except (netio.FetchError, netio.StopFetching):
+        if day:
+            raise
+        return fetch_valuation_openapi()
+    # ★ 指定了日期就一定要驗日期。對方忽略參數時會回最新一天，
+    #   而那份資料看起來完全正常 —— 只有日期是錯的。
+    if day and date != str(day):
+        raise netio.FetchError(
+            f"要 {day} 的估值，對方回的是 {date} —— 日期參數可能被忽略了")
+    return date, rows
 
 def fetch_dividends():
     """上市的除權息預告表。回傳 dividend 表的 rows。
