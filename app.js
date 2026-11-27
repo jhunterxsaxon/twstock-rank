@@ -694,7 +694,7 @@
       + '<span class="muted">　符合 ' + rows.length + ' 檔，顯示前 '
       + shown.length + ' 檔</span></div>';
 
-    html += '<div class="tablewrap"><table><thead><tr>';
+    html += '<div class="tablewrap"><table id="fund-table"><thead><tr>';
     FUND_COLS.forEach(function (c) {
       var on = c[1] === key;
       html += '<th data-sort="' + c[1] + '"'
@@ -713,7 +713,11 @@
     /* 點表頭排序。同一欄再點一次反向；換欄時用那一欄
        「第一次點的方向」，不要沿用上一欄的方向 ——
        從「本益比低→高」切到「殖利率」時沿用升冪會先看到最差的。 */
-    $('#fund-body').querySelector('thead')
+    /* ★ 指名 #fund-table，不要用 querySelector('thead')。
+       現在 #fund-body 裡只有這一張表，所以兩種寫法都會動；
+       但哪天在上面插一張表，querySelector 就會抓錯，而且不會報錯
+       （技術面那頁就是這個情況）。 */
+    $('#fund-table').querySelector('thead')
       .addEventListener('click', function (e) {
         var th = e.target.closest('th[data-sort]');
         if (!th) return;
@@ -756,6 +760,24 @@
       if (r.ok) ok.push(f); else wait.push(f);
     });
     return { ok: ok, wait: wait };
+  }
+
+  /* 代號與名稱是字串，其餘是數字。
+     ★ 數字走 cmpNum —— 沒有數值的排最後，而且不分升降冪。
+     技術面很多欄在暖機期內是 null（刻意不顯示數字，因為暖機期內擠出來
+     的 RSI 看起來正常，其實只是初始值的殘影）。把 null 當 0 會讓那些
+     股票混進排序結果裡，看起來像真的算出來了。 */
+  function techSorter(key, desc, idx, nm) {
+    var dir = desc ? -1 : 1;
+    if (key === 'stock_id' || key === 'name') {
+      return function (a, b) {
+        var x = key === 'name' ? (nm[a[0]] || '') : a[0];
+        var y = key === 'name' ? (nm[b[0]] || '') : b[0];
+        return (x < y ? -1 : x > y ? 1 : 0) * dir;
+      };
+    }
+    var si = idx[key];
+    return function (a, b) { return cmpNum(a[si], b[si], dir); };
   }
 
   function renderTech() {
@@ -802,41 +824,51 @@
       return;
     }
 
-    /* 排序欄位只取算得出來的那些 */
-    var sortF = S.techSort;
-    if (cols.ok.indexOf(sortF) < 0) sortF = cols.ok[0];
-    var dir = S.techDir === 'asc' ? 1 : -1;
+    /* 排序欄位只取算得出來的那些；代號與名稱永遠可排。
+       ★ 這個 fallback 一定要留：暖機期結束時 cols.ok 會變長，
+         而使用者先前選的欄位還存在 S 裡 —— 選了一個不存在的欄位會讓
+         idx[key] 變 undefined，整欄比較結果都是 0，排序看起來「沒反應」。 */
+    var key = S.techKey;
+    if (key !== 'stock_id' && key !== 'name' && cols.ok.indexOf(key) < 0) {
+      key = cols.ok[0];
+    }
+    /* ★ 第一次點的方向
+       數字一律高 → 低（和原本那兩個下拉選單的預設完全相同），
+       代號與名稱是升冪。
+       這裡**刻意不像基本面那樣逐欄指定方向** —— 技術指標沒有
+       「哪一端才有意義」的通則：RSI 高是超買、低是超賣，兩端都有意義；
+       連漲與連跌也是。所以維持原本的預設，第二次點就是另一個方向。 */
+    var strKey = (key === 'stock_id' || key === 'name');
+    var desc = S.techDesc === undefined ? !strKey : S.techDesc;
     var q = (S.techQ || '').trim();
 
     var rows = o.rows.filter(function (r) {
       if (!q) return true;
       return r[0].indexOf(q) >= 0 || (nm[r[0]] || '').indexOf(q) >= 0;
     });
-    var si = idx[sortF];
-    rows = rows.slice().sort(function (a, b) {
-      return cmpNum(a[si], b[si], dir);
-    });
+    rows = rows.slice().sort(techSorter(key, desc, idx, nm));
     var shown = rows.slice(0, 100);
 
+    /* ★ 兩個下拉選單（排序欄位 + 方向）都拿掉了 ——改成直接點表頭。
+       原本代號與名稱完全不能排（選單只列指標），現在每一欄都能排，
+       方向由「再點一次」決定，少一個控制項。 */
     html += '<div class="card"><div class="toolbar">'
-      + '<label>排序　<select id="tech-sort">';
-    cols.ok.forEach(function (f) {
-      html += '<option value="' + f + '"' + (f === sortF ? ' selected' : '')
-        + '>' + esc((o.zh || {})[f] || f) + '</option>';
-    });
-    html += '</select></label>'
-      + '<label>　<select id="tech-dir">'
-      + '<option value="desc"' + (dir < 0 ? ' selected' : '') + '>高 → 低</option>'
-      + '<option value="asc"' + (dir > 0 ? ' selected' : '') + '>低 → 高</option>'
-      + '</select></label>'
+      + '<span class="muted">點表頭可排序，再點一次反向　</span>'
       + '<label>　搜尋　<input id="tech-q" type="search" '
       + 'placeholder="代號或名稱" value="' + esc(q) + '"></label>'
       + '<span class="muted">　符合 ' + rows.length + ' 檔，顯示前 '
       + shown.length + ' 檔</span></div>';
 
-    html += '<div class="tablewrap"><table><thead><tr><th>代號</th><th>名稱</th>';
+    function techTh(k, label) {
+      var on = k === key;
+      return '<th data-sort="' + k + '"'
+        + (on ? ' class="sorted' + (desc ? ' desc' : '') + '"' : '')
+        + '>' + esc(label) + '</th>';
+    }
+    html += '<div class="tablewrap"><table id="tech-table"><thead><tr>'
+      + techTh('stock_id', '代號') + techTh('name', '名稱');
     cols.ok.forEach(function (f) {
-      html += '<th>' + esc((o.zh || {})[f] || f) + '</th>';
+      html += techTh(f, (o.zh || {})[f] || f);
     });
     html += '</tr></thead><tbody>';
     shown.forEach(function (r) {
@@ -853,12 +885,21 @@
     html += '</tbody></table></div></div>';
     $('#tech-body').innerHTML = html;
 
-    $('#tech-sort').addEventListener('change', function () {
-      S.techSort = this.value; renderTech();
-    });
-    $('#tech-dir').addEventListener('change', function () {
-      S.techDir = this.value; renderTech();
-    });
+    /* ★ 一定要用 #tech-table 指名，不能用 querySelector('thead') ——
+       這一頁在主表**前面**還有一張「還沒到暖機期的指標」表，
+       抓到那一張的話點了沒反應，而且完全不會報錯。 */
+    $('#tech-table').querySelector('thead')
+      .addEventListener('click', function (e) {
+        var th = e.target.closest('th[data-sort]');
+        if (!th) return;
+        var k = th.dataset.sort;
+        if (k === key) S.techDesc = !desc;
+        else {
+          S.techKey = k;
+          S.techDesc = !(k === 'stock_id' || k === 'name');
+        }
+        renderTech();
+      });
     $('#tech-q').addEventListener('input', function () {
       S.techQ = this.value;
       renderTech();
