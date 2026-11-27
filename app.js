@@ -552,20 +552,74 @@
     return (a - b) * dir;
   }
 
-  var FUND_SORTS = [
-    ['per_asc', '本益比低 → 高',
-      function (a, b) { return cmpNum(a.per, b.per, 1); }],
-    ['yield_desc', '殖利率高 → 低',
-      function (a, b) { return cmpNum(a.yield_pct, b.yield_pct, -1); }],
-    ['yoy_desc', '營收年增率高 → 低',
-      function (a, b) { return cmpNum(a.rev_yoy_pct, b.rev_yoy_pct, -1); }],
-    ['eps_desc', '累計 EPS 高 → 低',
-      function (a, b) { return cmpNum(a.eps_ytd, b.eps_ytd, -1); }],
-    ['rev_desc', '月營收大 → 小',
-      function (a, b) { return cmpNum(a.rev_revenue, b.rev_revenue, -1); }],
-    ['pbr_asc', '股價淨值比低 → 高',
-      function (a, b) { return cmpNum(a.pbr, b.pbr, 1); }]
+  /* ★ 一份清單同時決定表頭與每一列的儲存格 ★
+     原本表頭與 <td> 是分開寫死的，而表格有 13 欄 —— 新增或調動一欄時
+     兩邊很容易對不上，而且錯位之後頁面照樣顯示，只是數字跑到別的欄。
+     （榜單那張表 2026-11-26 就是為了這個加了「thead 欄數 == td 欄數」
+     的檢查。）這裡讓兩邊同源，錯位在結構上就不可能發生。
+
+     每一欄：[表頭文字, 取值的欄位, 第一次點的方向, 產生 <td> 的函式]
+
+     ★ 第一次點的方向很重要 ★
+       本益比、股價淨值比        越低越便宜  -> 升冪
+       殖利率、EPS、營收、成長率  越高越好    -> 降冪
+     全部預設升冪的話，點「殖利率」會先看到最差的那些 ——
+     功能是對的，但看起來像壞了。
+     這組方向就是原本下拉選單那六個選項所編碼的意圖，照搬過來。
+
+     ★ fnum/yi 回傳純文字，但 pct() 回傳的是**完整的 <td>**（含漲跌配色）。
+     兩者混用正是本檔第 531 行註解警告過的坑，所以這裡統一規定：
+     每一欄的函式都回傳完整的 <td>。 */
+  var ASC = 1, DESC = -1;
+  function tdText(v) { return '<td>' + v + '</td>'; }
+
+  var FUND_COLS = [
+    ['代號', 'id', ASC, function (r) { return tdText(esc(r.id)); }],
+    ['名稱', 'name', ASC, function (r) { return tdText(esc(r.name)); }],
+    ['本益比', 'per', ASC, function (r) { return tdText(fnum(r.per)); }],
+    ['股價淨值比', 'pbr', ASC, function (r) { return tdText(fnum(r.pbr)); }],
+    ['殖利率', 'yield_pct', DESC, function (r) {
+      return tdText(r.yield_pct === null || r.yield_pct === undefined
+        ? '—' : fnum(r.yield_pct) + '%');
+    }],
+    ['累計EPS', 'eps_ytd', DESC,
+      function (r) { return tdText(fnum(r.eps_ytd)); }],
+    ['累計營收(億)', 'revenue_ytd', DESC,
+      function (r) { return tdText(yi(r.revenue_ytd)); }],
+    ['營業利益(億)', 'op_income_ytd', DESC,
+      function (r) { return tdText(yi(r.op_income_ytd)); }],
+    ['稅後淨利(億)', 'net_income_ytd', DESC,
+      function (r) { return tdText(yi(r.net_income_ytd)); }],
+    ['月營收(億)', 'rev_revenue', DESC,
+      function (r) { return tdText(yi(r.rev_revenue)); }],
+    ['月增', 'rev_mom_pct', DESC, function (r) { return pct(r.rev_mom_pct); }],
+    ['年增', 'rev_yoy_pct', DESC, function (r) { return pct(r.rev_yoy_pct); }],
+    ['累計年增', 'rev_acc_yoy_pct', DESC,
+      function (r) { return pct(r.rev_acc_yoy_pct); }]
   ];
+
+  /* 一開始的排序：本益比低 -> 高，和原本下拉選單的預設選項相同。 */
+  var FUND_DEFAULT_KEY = 'per', FUND_DEFAULT_DESC = false;
+
+  function fundCol(key) {
+    var hit = FUND_COLS.filter(function (c) { return c[1] === key; });
+    return hit[0] || FUND_COLS[2];
+  }
+
+  /* 代號與名稱是字串，其餘是數字。
+     ★ 數字一律走 cmpNum —— 它把沒有數值的排到最後，**而且不分升降冪**。
+     把 null 當 0 會讓「虧損所以沒有本益比」的公司排到最前面，
+     看起來像是最便宜的股票。 */
+  function fundSorter(key, desc) {
+    var dir = desc ? -1 : 1;
+    if (key === 'id' || key === 'name') {
+      return function (a, b) {
+        var x = a[key] || '', y = b[key] || '';
+        return (x < y ? -1 : x > y ? 1 : 0) * dir;
+      };
+    }
+    return function (a, b) { return cmpNum(a[key], b[key], dir); };
+  }
 
   function fundRows() {
     var o = S.fund, nm = names();
@@ -598,7 +652,8 @@
 
   function renderFund() {
     var o = S.fund, d = fundRows();
-    var sortId = S.fundSort || FUND_SORTS[0][0];
+    var key = S.fundKey || FUND_DEFAULT_KEY;
+    var desc = S.fundDesc === undefined ? FUND_DEFAULT_DESC : S.fundDesc;
     var q = (S.fundQ || '').trim();
     var rows = d.rows;
     if (q) {
@@ -606,10 +661,7 @@
         return r.id.indexOf(q) >= 0 || (r.name || '').indexOf(q) >= 0;
       });
     }
-    var sorter = FUND_SORTS.filter(function (s) {
-      return s[0] === sortId;
-    })[0] || FUND_SORTS[0];
-    rows = rows.slice().sort(sorter[2]);
+    rows = rows.slice().sort(fundSorter(key, desc));
     var shown = rows.slice(0, 100);
 
     var html = '<div class="card"><h2>基本面</h2>'
@@ -632,45 +684,44 @@
       + '排序時一律排在最後。</p>'
       + '</div>';
 
+    /* ★ 排序下拉選單拿掉了 —— 改成直接點表頭。
+       13 欄都能排，原本的選單只有 6 種；選單那六個選項所編碼的
+       方向意圖，已經搬進 FUND_COLS 每一欄的「第一次點的方向」。 */
     html += '<div class="card"><div class="toolbar">'
-      + '<label>排序　<select id="fund-sort">';
-    FUND_SORTS.forEach(function (s) {
-      html += '<option value="' + s[0] + '"'
-        + (s[0] === sortId ? ' selected' : '') + '>' + esc(s[1]) + '</option>';
-    });
-    html += '</select></label>'
-      + '<label>　搜尋　<input id="fund-q" type="search" '
+      + '<span class="muted">點表頭可排序，再點一次反向　</span>'
+      + '<label>搜尋　<input id="fund-q" type="search" '
       + 'placeholder="代號或名稱" value="' + esc(q) + '"></label>'
       + '<span class="muted">　符合 ' + rows.length + ' 檔，顯示前 '
       + shown.length + ' 檔</span></div>';
 
-    html += '<div class="tablewrap"><table><thead><tr>'
-      + '<th>代號</th><th>名稱</th><th>本益比</th><th>股價淨值比</th>'
-      + '<th>殖利率</th><th>累計EPS</th><th>累計營收(億)</th>'
-      + '<th>營業利益(億)</th><th>稅後淨利(億)</th>'
-      + '<th>月營收(億)</th><th>月增</th><th>年增</th><th>累計年增</th>'
-      + '</tr></thead><tbody>';
+    html += '<div class="tablewrap"><table><thead><tr>';
+    FUND_COLS.forEach(function (c) {
+      var on = c[1] === key;
+      html += '<th data-sort="' + c[1] + '"'
+        + (on ? ' class="sorted' + (desc ? ' desc' : '') + '"' : '')
+        + '>' + esc(c[0]) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
     shown.forEach(function (r) {
-      html += '<tr><td>' + esc(r.id) + '</td><td>' + esc(r.name) + '</td>'
-        + '<td>' + fnum(r.per) + '</td>'
-        + '<td>' + fnum(r.pbr) + '</td>'
-        + '<td>' + (r.yield_pct === null || r.yield_pct === undefined
-          ? '—' : fnum(r.yield_pct) + '%') + '</td>'
-        + '<td>' + fnum(r.eps_ytd) + '</td>'
-        + '<td>' + yi(r.revenue_ytd) + '</td>'
-        + '<td>' + yi(r.op_income_ytd) + '</td>'
-        + '<td>' + yi(r.net_income_ytd) + '</td>'
-        + '<td>' + yi(r.rev_revenue) + '</td>'
-        + pct(r.rev_mom_pct)
-        + pct(r.rev_yoy_pct)
-        + pct(r.rev_acc_yoy_pct) + '</tr>';
+      html += '<tr>';
+      FUND_COLS.forEach(function (c) { html += c[3](r); });
+      html += '</tr>';
     });
     html += '</tbody></table></div></div>';
     $('#fund-body').innerHTML = html;
 
-    $('#fund-sort').addEventListener('change', function () {
-      S.fundSort = this.value; renderFund();
-    });
+    /* 點表頭排序。同一欄再點一次反向；換欄時用那一欄
+       「第一次點的方向」，不要沿用上一欄的方向 ——
+       從「本益比低→高」切到「殖利率」時沿用升冪會先看到最差的。 */
+    $('#fund-body').querySelector('thead')
+      .addEventListener('click', function (e) {
+        var th = e.target.closest('th[data-sort]');
+        if (!th) return;
+        var k = th.dataset.sort;
+        if (k === key) S.fundDesc = !desc;
+        else { S.fundKey = k; S.fundDesc = fundCol(k)[2] === -1; }
+        renderFund();
+      });
     $('#fund-q').addEventListener('input', function () {
       S.fundQ = this.value;
       renderFund();
