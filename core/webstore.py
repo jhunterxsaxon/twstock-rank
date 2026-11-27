@@ -371,6 +371,29 @@ def dump_meta(conn, date, scheduled=None, started=None, notes=None,
             age = None
     now = datetime.now(timezone.utc)
     q = lambda s: conn.execute(s).fetchone()[0]
+
+    # ★ 回補過的日子要在公開頁面上講出來。
+    #   price_daily.src 標不住（月檔沒存 src，載回來全變 'web'），
+    #   所以 fetch.py 把它寫在 data/backfilled.json，這裡讀回來。
+    #   ★ 為什麼非講不可：上櫃回補的來源（資料集 11371）只含整股，
+    #   每日路徑走的 openapi 含整股＋零股。那天的成交量與成交金額
+    #   會比其他日子略低（2026-11-24 逐檔比對：中位數低 1.73%），
+    #   而頁面上看起來完全正常。不講就是把一個看不見的落差留給使用者。
+    bf = {}
+    try:
+        bf = json.load(open(_p("backfilled.json"), encoding="utf-8"))
+    except Exception:
+        bf = {}
+    notes = list(notes or [])
+    if bf:
+        ds = "、".join(sorted(bf))
+        notes.append(
+            f"{ds} 的上櫃行情是事後回補的（政府資料開放平臺資料集 11371）。"
+            f"該來源只含整股、不含零股，所以這些日子的成交量與成交金額"
+            f"會比其他日子略低（中位數約 1.7%），只有零股成交的個股不會"
+            f"出現在成交量榜上。漲幅榜、跌幅榜與振幅榜不受影響"
+            f"（它們用的是開高低收與官方漲跌價差，和每日來源逐檔相同）。")
+
     meta = {
         "data_date": date,
         "scheduled": scheduled,
@@ -379,6 +402,8 @@ def dump_meta(conn, date, scheduled=None, started=None, notes=None,
         "same_day": (date == datetime.now().strftime("%Y-%m-%d")),
         "age_days": age,
         "missing": list(missing or []),
+        # 結構化的回補紀錄（註記是給人看的，這個是給程式/測試看的）
+        "backfilled": bf,
         "trading_days": len(days),
         "first_date": days[0] if days else None,
         "stocks": q("SELECT COUNT(*) FROM stock"),

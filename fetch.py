@@ -73,6 +73,13 @@ def open_db():
 SRC_ZH = {"opendata": "開放資料平臺．當日",
           "openapi": "openapi．T+1（備援）"}
 
+# ★ 回補過的日子要記下來，而且要記在**會進 git 的檔案**裡。
+#   price_daily.src 不行 —— 月檔 JSON 根本沒存 src，載回來全變 'web'，
+#   所以標在 src 上的來源標記活不過一次來回。
+#   dump_meta() 會讀這個檔，把回補過的日子寫進 meta.json 的註記，
+#   這樣公開頁面上就講得出來，而且每次重跑都還在。
+BACKFILL_LOG = os.path.join("data", "backfilled.json")
+
 PROBE_LOG = os.path.join("data", "probe_log.csv")
 PROBE_COLS = ("run_at_tpe", "scheduled", "twse_date", "twse_modified_tpe",
               "tpex_date", "tpex_modified_tpe",
@@ -183,6 +190,144 @@ def append_probe(row):
         if new:
             w.writerow(PROBE_COLS)
         w.writerow([row.get(c, "") for c in PROBE_COLS])
+
+
+def read_backfilled():
+    """讀回補紀錄。回傳 {date: {"market": ..., "basis": ...}}。"""
+    try:
+        return json.load(open(BACKFILL_LOG, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_backfilled(d):
+    with open(BACKFILL_LOG, "w", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False, indent=1, sort_keys=True))
+
+
+def price_gaps(conn):
+    """找出只有單一市場行情的交易日。回傳 [(date, 缺的市場), ...]。
+
+    db.partial_days() 回的是「有哪個市場」，這裡轉成「缺哪個市場」——
+    回補要知道的是後者。
+    """
+    out = []
+    for d, have in db.partial_days(conn):
+        out.append((d, "tpex" if have == "twse" else "twse"))
+    return out
+
+
+def backfill_prices(conn, only=None):
+    """補半套交易日的行情。**只有上櫃補得回來。**
+
+    ★ 上市補不回來
+    2026-11-27 查遍 data.gov.tw：上市的登記資料集只有
+    `STOCK_DAY_ALL?response=open_data`（只給最新一天）、個股年成交、
+    大盤統計、前二十名、盤後定價 —— 沒有依日期查詢的個股日成交。
+    平臺上甚至有一個建議案（136936）正是在要這個，狀態「已回復」。
+    所以漏掉上市那半，仍然是永久損失。
+
+    ★★ 上櫃回補的來源和每日路徑**基礎不同**，這件事一定要講出來 ★★
+    資料集 11371（stk_wn1430 = 14:30 收盤行情）只含**整股**；
+    每日路徑走的 openapi 含整股＋零股。2026-11-24 逐檔比對 895 檔：
+
+        開/高/低/收、官方漲跌價差   逐檔完全相同
+        成交股數/金額/筆數          CSV 永遠較低
+                                   中位數低 1.73%、平均 3.8%
+                                   最大 100%（那天只有零股成交的檔）
+
+    所以回補那天的**漲幅榜、跌幅榜、振幅榜完全正確**（只用高低收與
+    官方漲跌價差），**成交量榜與成交金額榜會略低**，而且只有零股成交的
+    檔會從榜上消失。比「那天完全沒有資料」好得多，但不是同一份資料 ——
+    這就是為什麼要寫 data/backfilled.json 並在 meta 註記。
+    """
+    ZH = {"twse": "上市", "tpex": "上櫃"}
+    allow = db.whitelist(conn)
+    if not allow:
+        log("✖ 白名單是空的，無法繼續")
+        return 1
+
+    gaps = price_gaps(conn)
+    if only:
+        gaps = [g for g in gaps if g[0] == only]
+        if not gaps:
+            log(f"{only} 不是半套交易日，沒有要補的")
+            return 0
+    if not gaps:
+        log("沒有半套交易日，不用補")
+        return 0
+
+    log(f"半套交易日 {len(gaps)} 天：")
+    for d, mk in gaps:
+        log(f"  {d}  缺 {ZH[mk]}")
+
+    fixed, failed, unfixable = [], [], []
+    for d, mk in gaps:
+        if mk == "twse":
+            # ★ 不要靜悄悄跳過 —— 使用者會以為補好了
+            unfixable.append(d)
+            log(f"  ✖ {d} 缺上市 —— 官方沒有依日期查詢的上市個股日成交"
+                f"資料集，補不回來")
+            continue
+        try:
+            got, rows = tpex.fetch_price_by_date(d)
+        except Exception as e:
+            failed.append(f"{d}（{e}）")
+            log(f"  ✖ {d} 上櫃：{e}")
+            continue
+        keep = [r for r in rows if r["stock_id"] in allow]
+        n = db.upsert_price(conn, [
+            (r["stock_id"], d, r["open"], r["high"], r["low"], r["close"],
+             int(r["volume"] or 0), r["amount"] or 0, int(r["trades"] or 0),
+             "tpex-od", r.get("chg"))
+            for r in keep])
+        fixed.append(d)
+        log(f"  ✔ {d} 上櫃　{n} 筆（對方回報 {got}，原始 {len(rows)} 筆）")
+    conn.commit()
+
+    if not fixed:
+        log("✖ 一天都沒補到"
+            + (f"；{len(unfixable)} 天缺上市（補不回來）" if unfixable else ""))
+        return 1
+
+    # ★★ 一定要從最早被補的那天開始往後全部重算榜單 ★★
+    # 「連續在榜天數」與「排名變化」是拿前一個交易日的快照推出來的。
+    # 在中間插進一個新的完整交易日，它**後面每一天**的 streak 與 move
+    # 就都錯了 —— 而那些數字看起來完全正常。
+    complete = db.complete_days(conn)
+    start = min(fixed)
+    todo = [d for d in complete if d >= start]
+    log(f"重算榜單（{todo[0]} ~ {todo[-1]}，共 {len(todo)} 天）…")
+    for i, d in enumerate(todo, 1):
+        ranking.build_date(conn, d, allow=allow)
+        if i % 50 == 0:
+            log(f"  {i}/{len(todo)}")
+    conn.commit()
+
+    # ★ 把回補過的日子記進會進 git 的檔案，meta 才講得出來
+    rec = read_backfilled()
+    for d in fixed:
+        rec[d] = {"market": "tpex", "source": "data.gov.tw 11371",
+                  "basis": "整股（不含零股）"}
+    write_backfilled(rec)
+
+    log("匯出 JSON…")
+    for ym in sorted({ws.month_of(d) for d in todo}):
+        ws.dump_month_prices(conn, ym)
+        ws.dump_month_boards(conn, ym)
+        log(f"  {ym}")
+    rank_date = complete[-1]
+    ws.dump_latest(conn, rank_date)
+    ws.dump_markets(conn, rank_date)
+    log("算技術指標…")      # 價量變了，指標跟著變
+    ws.dump_technical(conn, progress=log)
+    ws.dump_meta(conn, rank_date, notes=[], missing=missing_days(conn, rank_date))
+    ws.history_index()
+    log(f"完成。補了 {len(fixed)} 天：{'、'.join(fixed)}"
+        + (f"；{len(unfixable)} 天缺上市補不回來：{'、'.join(unfixable)}"
+           if unfixable else "")
+        + (f"；{len(failed)} 項失敗：{'；'.join(failed)}" if failed else ""))
+    return 0
 
 
 def valuation_gaps(conn):
@@ -325,6 +470,10 @@ def main(argv=None):
                     default=None, metavar="YYYY-MM-DD",
                     help="補估值不完整的交易日（兩市的估值都吃日期）。"
                          "給日期只補那天，不給就自動找出缺口")
+    ap.add_argument("--backfill-price", nargs="?", const="auto",
+                    default=None, metavar="YYYY-MM-DD",
+                    help="補只有單一市場的交易日。★ 只有上櫃補得回來，"
+                         "而且來源只含整股（見 backfill_prices 說明）")
     a = ap.parse_args(argv)
 
     notes = []
@@ -345,6 +494,12 @@ def main(argv=None):
     # ★ 回補要在探測之前分支出去。
     #   探測底下有「兩市都沒有新資料 -> 結束」的提早返回，
     #   而回補正是要在沒有新資料的時候也能跑。
+    if a.backfill_price:
+        rc = backfill_prices(
+            conn, None if a.backfill_price == "auto" else a.backfill_price)
+        conn.close()
+        return rc
+
     if a.backfill_valuation:
         rc = backfill_valuations(
             conn,

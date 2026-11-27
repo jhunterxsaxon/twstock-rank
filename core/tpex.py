@@ -44,6 +44,31 @@ from core import netio
 BASE = "https://www.tpex.org.tw/openapi/v1"
 
 EP_PRICE = f"{BASE}/tpex_mainboard_daily_close_quotes"
+
+# ★★ 依日期回補上櫃價量走這條 ★★
+#
+# 2026-11-27 查 data.gov.tw 資料集 11371 得到：
+#     名稱  上櫃股票收盤行情（櫃買中心）
+#     授權  1（政府資料開放授權條款第 1 版）
+#
+# ★ 和估值（資料集 11373）同一個 `.php?...&o=data` 家族，**同樣吃 `&d=`**：
+#   2026-11-27 實測：
+#       不帶日期       -> 1151126，1,021 筆
+#       d=115/11/24    -> 1151124，1,020 筆
+#
+# ★ 已驗證過和現用的 openapi 來源是同一份資料：
+#   11-24 那天白名單上櫃 898 檔裡這份 CSV 蓋到 895 檔 ——
+#   和本機已有的 895 檔完全一致（缺的 4804/8084/8291 當天沒成交），
+#   開高低收抽樣五檔數字完全相同。
+#
+# ★ 為什麼不拿它取代 fetch_price()
+#   每日路徑不需要日期，而 openapi 那條已經穩定跑了兩週。
+#   這條只在「回補」時用 —— 回補是新能力，不是換來源。
+#
+# 欄位比 openapi 多：最後買價/賣價、發行股數、次日漲跌停價（都不存）。
+EP_PRICE_OPENDATA = ("https://www.tpex.org.tw/web/stock/aftertrading/"
+                     "otc_quotes_no1430/stk_wn1430_result.php"
+                     "?l=zh-tw&se=EW&o=data")
 EP_MARGIN = f"{BASE}/tpex_mainboard_margin_balance"
 EP_CHIP = f"{BASE}/tpex_3insti_daily_trading"
 EP_COMPANY = f"{BASE}/mopsfin_t187ap03_O"
@@ -140,6 +165,78 @@ def fetch_price():
             "chg": netio.num(_pick(r, "change", required=False)),
         })
     return date, out
+
+
+# 依日期的上櫃價量 CSV 欄位對應。**依欄位名**解析，不靠位置。
+# ★ 注意欄名和 openapi 完全不同（收盤 vs Close、代號 vs Code），
+#   也和上市的 CSV 不同（代號 vs 證券代號）—— 三套都不能共用。
+_PRICE_CSV_MAP = {
+    "代號": "stock_id", "名稱": "name",
+    "開盤": "open", "最高": "high", "最低": "low", "收盤": "close",
+    "成交股數": "volume", "成交金額": "amount", "成交筆數": "trades",
+    "漲跌": "chg",
+}
+
+
+def _parse_price_csv(text):
+    """解析資料集 11371 的上櫃收盤行情 CSV。回傳 (date, rows)。
+
+    rows 的形狀和 fetch_price() 一樣（dict），呼叫端不必分兩套。
+    """
+    rdr = csv.DictReader(_io.StringIO(text))
+    if not rdr.fieldnames:
+        raise netio.FetchError("上櫃價量 CSV 沒有標題列")
+    missing = [k for k in _PRICE_CSV_MAP if k not in rdr.fieldnames]
+    if missing:
+        # 欄位名變了就停下來。少一欄會讓整欄變 None 或 0，
+        # 而榜單照樣算得出來 —— 那種錯誤沒有人會發現。
+        raise netio.FetchError(
+            f"上櫃價量 CSV 缺少欄位 {missing}，實際有 {rdr.fieldnames}")
+    date, out = None, []
+    for r in rdr:
+        sid = (r.get("代號") or "").strip()
+        if not sid:
+            continue
+        if date is None:
+            date = netio.roc_to_iso((r.get("資料日期") or "").strip())
+        out.append({
+            "stock_id": sid,
+            "name": (r.get("名稱") or "").strip(),
+            "open": netio.num(r.get("開盤")),
+            "high": netio.num(r.get("最高")),
+            "low": netio.num(r.get("最低")),
+            "close": netio.num(r.get("收盤")),
+            "volume": _num0(r.get("成交股數")),
+            "amount": _num0(r.get("成交金額")),
+            "trades": _num0(r.get("成交筆數")),
+            # ★ 官方漲跌價差（帶正負號，netio.num 會處理）。
+            #   做漲跌幅榜一定要用這個，不能用 (收盤 − 前日收盤) 自己算 ——
+            #   除權息當天會跳空，自己算會得到假性大跌。
+            "chg": netio.num(r.get("漲跌")),
+        })
+    if not out:
+        raise netio.FetchError("上櫃價量 CSV 沒有資料列")
+    if not date:
+        raise netio.FetchError("上櫃價量 CSV 無法解析日期")
+    return date, out
+
+
+def fetch_price_by_date(day):
+    """指定日期的上櫃全市場行情。回傳 (date, rows)，rows 同 fetch_price()。
+
+    ★ 這是**回補**用的，每日路徑仍走 fetch_price()（openapi）。
+
+    ★ 沒有備援，而且一定驗日期。
+    日期參數寫錯時對方不會拒絕，會回最新一天 —— 那份資料筆數對、
+    數字合理，只有日期是錯的，寫進去之後會變成一份錯誤的歷史行情。
+    """
+    url = EP_PRICE_OPENDATA + "&d=" + _roc_slash(day)
+    date, rows = _parse_price_csv(
+        netio.get_text(url, limiter=_limiter, timeout=120))
+    if date != str(day):
+        raise netio.FetchError(
+            f"要 {day} 的上櫃行情，對方回的是 {date} —— 日期參數可能被忽略了")
+    return date, rows
 
 
 # ---------------- 融資融券 ----------------
